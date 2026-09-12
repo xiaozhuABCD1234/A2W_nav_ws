@@ -30,6 +30,13 @@ venv/
 *.log
 results/
 
+# point_lio 运行期在**源码树**里生成的文件：laserMapping.cpp 启动时直接以 "w" 打开它们，
+# 而 ROOT_DIR 是编译期烧进二进制的源码目录（本地 P8 只把 PCD 路径改成了相对）。
+# 默认 runtime_pos_log_enable=false，所以它们是 0 字节；开了才有内容。
+src/point_lio_ros2/Log/pos_log.txt
+src/point_lio_ros2/Log/imu_pbp.txt
+src/point_lio_ros2/Log/mat_out.txt
+
 # ---------- 编译器 / 工具产物 ----------
 compile_commands.json
 .clangd/
