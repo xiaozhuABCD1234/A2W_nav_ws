@@ -56,6 +56,28 @@ base_link ─（单位阵）─▶ a2w/base       旧名别名（向后兼容）
 （之前用过不带 `--symlink-install` 的 `colcon build`），必须先
 `colcon build --packages-select a2w_bridge` 才会刷新（是软链时则即时生效）。
 
+## 量机器人高度（按 TF）
+
+```bash
+ros2 run a2w_bridge a2w_base_height                      # base_link 离地高度（每秒一行）
+ros2 run a2w_bridge a2w_base_height --frame a2w/lidar     # 雷达离地高度（任意坐标系都行）
+ros2 run a2w_bridge a2w_base_height --once                # 只打一行就退出（脚本取值用）
+ros2 run a2w_bridge a2w_base_height --ground-frame a2w/ground
+      # 另发动态 TF base_link → a2w/ground；RViz 把 Fixed Frame 改成 a2w/ground，
+      # 机器人就“站”在网格地面上（可直观检查高度对不对）
+```
+
+原理：URDF 四个轮子 mesh 的最低点 = 轮心 − 半径（`meshes/*_Link4.STL` 量得半径
+**0.09486 m**），四轮最低点在 `base_link` 系里的 z 就是地面（取最低的轮 → 平地/单轮悬空都能用），
+反号就是 `base_link` 离地高度；量别的坐标系再做一次 TF 换算。
+
+- 需要 TF 在位：`ros2 launch a2w_bridge a2w_joint_display.launch.py`（URDF + 关节）+ 桥（提供关节角、外参）
+- 高度**随姿势变**：比如 `运控=待机` 腿收着停放时 `base_link` 只有 ~0.10 m，站起来会变高
+- 输出里四轮接地点差 > 20 mm 会提醒“不在平地或某轮没落地”
+- 实测（2026-09，待机停放姿势）：`base_link` 0.104 m、`a2w/lidar` 0.185 m；
+  与点云地面法（云里最低点约在雷达下方 0.15 m）相差 ~3 cm —— 差在
+  URDF 是**刚性轮**、实际橡胶胎受压会扁 ~2–3 cm
+
 ## ⚠️ ROS 域隔离（必读：不隔离会触发机器狗软急停）
 
 A2W 的 `192.168.123.0/24`（交换机1）是官方文档写明的**“DDS控制信号”局域网**。本机 ROS2

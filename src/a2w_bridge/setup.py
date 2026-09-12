@@ -27,6 +27,7 @@ setup(
         "console_scripts": [
             "a2w_bridge_node = a2w_bridge.node:main",
             "joint_relay = a2w_bridge.joint_relay:main",
+            "a2w_base_height = a2w_bridge.base_height:main",
         ],
     },
 )
