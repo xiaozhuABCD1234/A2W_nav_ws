@@ -76,8 +76,9 @@ DEFAULTS: dict[str, Any] = {
         # multi : 同时订阅 fused/front/rear（会成倍占用链路，需自行确认交换机带宽）
         "mode": "single",
         # single 模式的来源: fused / front / rear / mapping / relocation / auto
-        # 默认 fused（前后雷达融合）；auto = 按 failover_order 轮换（当前话题长时间无数据就换下一个）
-        "source": "fused",
+        # 随包配置里是 front（只订阅前雷达）；也可设 fused（前后雷达融合点云）、
+        # auto = 按 failover_order 轮换（当前话题长时间无数据就换下一个）
+        "source": "front",
         "failover_order": list(CLOUD_FAILOVER_ORDER),
         "stale_sec": 6.0,
         "topic": "a2w/points",
@@ -87,6 +88,8 @@ DEFAULTS: dict[str, Any] = {
             "rear": "a2w/points_rear",
         },
         "frame_id": "a2w/lidar",
+        # 注：机器人发的三路点云（融合/前/后）**都已经是前雷达坐标系**（后雷达点云在机器人侧
+        # 已变换到前雷达），所以三路共用这一个 frame；外参见 tf.transforms。
         # 输出字段（标准 PointCloud2 字段名）；可用: x y z intensity ring timestamp
         "fields": ["x", "y", "z", "intensity"],
         "max_points": 0,   # >0 = 每帧随机抽稀到该点数（0 = 全量）
@@ -104,7 +107,18 @@ DEFAULTS: dict[str, Any] = {
             "lidar_rear": "a2w/imu_rear",
             "lowstate": "a2w/imu_lowstate",
         },
-        "frame_id": "a2w/imu",
+        "frame_id": "a2w/imu",  # 兜底（frames 里没列的源）
+        # 每路源各自的坐标系（结构外参，JT128 雷达内部 IMU 与雷达同姿）：
+        #   lidar_front 前雷达 IMU → a2w/lidar
+        #   lidar_rear  后雷达 IMU → a2w/lidar_rear
+        #     ⚠️ 机器人把 imu2 的 frame_id 也写成 hesai_lidar（本机实测），照搬会让
+        #        后 IMU 的朝向差 180°（两雷达绕 y 互转 180°），必须在这里覆盖
+        #   lowstate    机身上的低电平 IMU → a2w/imu（与 base_link 同姿）
+        "frames": {
+            "lidar_front": "a2w/lidar",
+            "lidar_rear": "a2w/lidar_rear",
+            "lowstate": "a2w/imu",
+        },
         "stale_sec": 2.0,
     },
     "joints": {
@@ -157,10 +171,25 @@ DEFAULTS: dict[str, Any] = {
     },
     "tf": {
         "enabled": True,
-        # 静态 TF: 机器人本体(base) → 各传感器；按实机安装尺寸填 xyz/rpy
+        # 静态 TF。根用 URDF 的 base_link（结构外参就是相对它标定的），单位：米/弧度（ZYX）。
+        # 2026-09 标定：
+        #   base_link ← 前雷达(JT128，机器人里叫 hesai_lidar)：
+        #       T=[0.33767, 0, 0.08134]，R=[[0,0,1],[1,0,0],[0,1,0]] → rpy=[90°,0,90°]
+        #       （雷达 x→机身 y、y→z、z→x）
+        #   前雷达 ← 后雷达：
+        #       T=[0, 0.00599, -0.61764]，R=diag(-1,1,-1) → rpy=[180°,0,180°]（绕 y 转 180°）
+        #       ⇒ 后雷达在 base_link 后方 0.280 m（= 0.33767-0.61764），两雷达相距 0.61764 m
+        # 换机器人/重新标定只改这几条 xyz/rpy 即可。
         "transforms": [
-            {"parent": "a2w/base", "child": "a2w/lidar", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0]},
-            {"parent": "a2w/base", "child": "a2w/imu", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0]},
+            {"parent": "base_link", "child": "a2w/lidar", "xyz": [0.33767, 0.0, 0.08134],
+             "rpy": [1.5707963, 0.0, 1.5707963]},
+            {"parent": "a2w/lidar", "child": "a2w/lidar_rear", "xyz": [0.0, 0.00599, -0.61764],
+             "rpy": [3.1415927, 0.0, 3.1415927]},
+            {"parent": "base_link", "child": "a2w/imu", "xyz": [0.0, 0.0, 0.0],
+             "rpy": [0.0, 0.0, 0.0]},
+            # 旧名别名：a2w/base 就是 base_link（保持向后兼容）
+            {"parent": "base_link", "child": "a2w/base", "xyz": [0.0, 0.0, 0.0],
+             "rpy": [0.0, 0.0, 0.0]},
         ],
     },
 }
@@ -243,6 +272,10 @@ def _normalize(cfg: dict[str, Any]) -> None:
     imu["source"] = str(imu.get("source", "auto")).lower()
     imu["stale_sec"] = _num(float, "imu.stale_sec", imu.get("stale_sec", 2.0) or 2.0)
     imu.setdefault("topics", {})
+    _raw_frames = imu.get("frames")
+    imu["frames"] = (
+        {str(k): str(v) for k, v in _raw_frames.items()} if isinstance(_raw_frames, dict) else {}
+    )
 
     joints = cfg["joints"]
     joints["names"] = _as_list(joints.get("names")) or list(A2W_JOINT_NAMES)
@@ -323,6 +356,14 @@ def validate(cfg: dict[str, Any]) -> None:
         raise ConfigError(
             f"imu.source 只能是 auto/all/{'/'.join(IMU_TOPICS)}，当前 {imu['source']!r}"
         )
+    bad_frames = [k for k in imu.get("frames", {}) if k not in IMU_TOPICS]
+    if bad_frames:
+        raise ConfigError(
+            f"imu.frames 含未知来源 {bad_frames}，可用: {list(IMU_TOPICS)}（值是 frame_id，不能为空）"
+        )
+    empty_frames = [k for k, v in imu.get("frames", {}).items() if not str(v).strip()]
+    if empty_frames:
+        raise ConfigError(f"imu.frames 里 {empty_frames} 的 frame_id 为空；要沿用兜底就删掉该键")
 
     joints = cfg["joints"]
     if joints["enabled"]:
@@ -365,6 +406,20 @@ def validate(cfg: dict[str, Any]) -> None:
     if disp["enabled"] and not joints.get("enabled", True):
         raise ConfigError(
             "display.enabled=true 需要 joints.enabled=true（关节角来自 joints 那路 rt/lowstate 订阅）"
+        )
+
+    tf_items = cfg.get("tf", {}).get("transforms", [])
+    children: list[str] = []
+    for item in tf_items:
+        if not isinstance(item, dict) or not str(item.get("parent", "")).strip() or not str(
+            item.get("child", "")
+        ).strip():
+            raise ConfigError(f"tf.transforms 每项都需要 parent/child，非法项: {item!r}")
+        children.append(str(item["child"]))
+    dup = sorted({c for c in children if children.count(c) > 1})
+    if dup:
+        raise ConfigError(
+            f"tf.transforms 里同一个子坐标系出现多次 {dup}；一个坐标系只能有一个父（否则 TF 树冲突）"
         )
 
 

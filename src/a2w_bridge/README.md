@@ -13,9 +13,48 @@
 | SLAM 广播 | `rt/slam_info` / `rt/slam_key_info` | `a2w/slam_info` / `a2w/slam_key_info` | `std_msgs/String`（JSON 透传） |
 | 全局占据栅格 | `rt/unitree/slam_relocation/global_map` | `a2w/map/grid`（默认关） | `nav_msgs/OccupancyGrid` |
 | 机器人状态 | —（桥把 lowstate/bms 汇总） | `a2w/status` | `std_msgs/String`（JSON，默认 5 s） |
-| 静态 TF | — | `/tf_static` | base → lidar / imu（按配置） |
+| 静态 TF | — | `/tf_static` | 结构外参：base_link → 前雷达/后雷达/IMU（见下节） |
 
 所有话题时间戳用**采集端墙钟**统一打点；机器人自带时间戳只进日志不做时钟源。
+
+## 结构外参与坐标系（TF）
+
+标定给出的结构外参（JT128 雷达头/尾各一，2026-09），桥按此发布静态 TF：
+
+```text
+base_link ─T=[0.33767, 0, 0.08134] R=[[0,0,1],[1,0,0],[0,1,0]] (rpy=[90°,0,90°])─▶ a2w/lidar       前雷达（= hesai_lidar）
+a2w/lidar ─T=[0, 0.00599, -0.61764] R=diag(-1,1,-1) (rpy=[180°,0,180°])──────────▶ a2w/lidar_rear  后雷达
+base_link ─（单位阵）─▶ a2w/imu        机身上的低电平 IMU
+base_link ─（单位阵）─▶ a2w/base       旧名别名（向后兼容）
+```
+
+两雷达相距 0.61764 m，后雷达在 `base_link` 后方 0.280 m（= 0.33767 − 0.61764）。
+`rpy` 是 ZYX 顺序、单位弧度；**重新标定只改 JSON 的 `tf.transforms`，不用改代码**。
+
+**各话题的坐标系归属**（机器人侧定义 + 桥发布的 frame_id）：
+
+| 机器人话题 | 数据原点坐标系（机器人侧定义） | 桥发布的 `frame_id` |
+| --- | --- | --- |
+| `…slam_lidar/points`（融合） | **前雷达** | `a2w/lidar` |
+| `…slam_lidar/points1`（前雷达） | **前雷达** | `a2w/lidar` |
+| `…slam_lidar/points2`（后雷达） | **前雷达**（机器人已变换过去） | `a2w/lidar` |
+| `…slam_lidar/imu1`（前雷达 IMU） | **前雷达**（JT128 内部 IMU 与雷达同姿） | `a2w/lidar` |
+| `…slam_lidar/imu2`（后雷达 IMU） | **后雷达** | `a2w/lidar_rear` ← 见下面的坑 |
+| `rt/lowstate` 里的 `imu_state`（机身 IMU） | 机身 | `a2w/imu` |
+
+⚠️ **坑：机器人把上述５个话题的 `frame_id` 全写成 `hesai_lidar`（本机实测）**，但 `imu2` 实际是
+后雷达坐标系（两雷达绕 y 互转 180°）。照搬机器人的 frame_id 会让后 IMU 的朝向差 180°,
+下游（Point-LIO / robot_localization）会把加速度/角速度解错。所以桥**按源覆盖** frame_id，不照搬。
+
+按源覆盖的位置（都在 JSON，改标定不改代码）：
+
+- `imu.frames`：`lidar_front → a2w/lidar`、`lidar_rear → a2w/lidar_rear`、`lowstate → a2w/imu`
+  （`imu.frame_id` 是没列在 `frames` 里的源的兜底值）
+- `pointcloud.frame_id`：`a2w/lidar`（三路点云都是前雷达坐标系，共用一个）
+
+改完配置**重启节点**生效；若 `install/...share/a2w_bridge/config/*.json` 是**普通文件**
+（之前用过不带 `--symlink-install` 的 `colcon build`），必须先
+`colcon build --packages-select a2w_bridge` 才会刷新（是软链时则即时生效）。
 
 ## ⚠️ ROS 域隔离（必读：不隔离会触发机器狗软急停）
 
@@ -62,9 +101,10 @@ ros2 launch a2w_bridge a2w_points_rviz.launch.py rviz:=false
 ros2 launch a2w_bridge a2w_points_rviz.launch.py rviz_config:=/path/my.rviz
 ```
 
-- RViz 配置：`config/a2w_points.rviz` —— `Fixed Frame = a2w/lidar`（与 JSON 的
-  `pointcloud.frame_id` 必须一致），**默认只显示一项：融合点云**（话题 `/a2w/points`，
-  因为桥默认 `mode=single` + `source=fused`，这一话题里就是前后雷达融合点云）；
+- RViz 配置：`config/a2w_points.rviz` —— `Fixed Frame = base_link`（= TF 的根，也是 URDF 的根，
+  所以点云能和机器人模型叠着看；改成 `a2w/lidar` 就是雷达视角）；**默认只显示一项**：
+  话题 `/a2w/points`（single 模式下这一话题里就是 JSON 里 `pointcloud.source` 指定的那一路，
+  当前配置是 `front` 前雷达；也可设 `fused` 融合、`auto` 断流轮换）；
   `multi` 模式的三路（`points_fused|front|rear`）在配置里**注释保留**，需要时打开注释
   或 RViz 里 Add 三个 PointCloud2
 - 改话题名/坐标系/点大小：直接编辑这份 rviz 配置（RViz 里改完也可另存）
@@ -246,7 +286,7 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生
 | `collector.port` | `42610` | 本机 TCP 端口（冲突时改） |
 | `pointcloud.enabled` | `true/false` | 是否收点云 |
 | `pointcloud.mode` | `single`（默认）/ `multi` | `single`=同一时刻只订阅一个点云话题；`multi`=同时收 fused/front/rear 发到 `multi_topics` |
-| `pointcloud.source` | **`fused`**（默认）/ `front` / `rear` / `mapping` / `relocation` / `auto` | `single` 模式的点云源。默认固定**融合**点云、不轮换；`auto` = 按 `failover_order` 轮换（当前源长时间无数据就换下一个） |
+| `pointcloud.source` | **`front`**（当前配置）/ `fused` / `rear` / `mapping` / `relocation` / `auto` | `single` 模式的点云源。`front` = 只订阅前雷达（本配置现状）；`fused` = 前后雷达融合点云、不轮换；`auto` = 按 `failover_order` 轮换（当前源长时间无数据就换下一个） |
 | `pointcloud.failover_order` | `["fused","front","rear"]` | `auto` 时的轮换顺序（无数据超过 `stale_sec` 换下一个） |
 | `pointcloud.stale_sec` | `6.0` | 多少秒收不到数据判定“断了” |
 | `pointcloud.topic` / `frame_id` | `a2w/points` / `a2w/lidar` | `single` 模式输出话题与坐标系 |
@@ -279,9 +319,9 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生
 
 因此：
 
-1. **`single` 模式一次只订阅一个点云话题**（默认，且默认源固定为 `fused` 融合点云，不轮换）；
-   想要熔断降级就把 `pointcloud.source` 改成 `auto` —— 它在当前源 `stale_sec` 无数据时
-   自动轮换（实测融合源时有时无，`front` 通常最稳）；
+1. **`single` 模式一次只订阅一个点云话题**（默认；源固定为 `pointcloud.source`，当前配置是
+   `front` 前雷达，不轮换）；想要熔断降级就把 `pointcloud.source` 改成 `auto` —— 它在当前源
+   `stale_sec` 无数据时自动轮换（实测融合源时有时无，`front` 通常最稳）；
 2. 点云 reader 固定 `BEST_EFFORT + KEEP_LAST(1)`：不触发重传、不积压历史帧；
 3. `multi` 模式会同时拉 fused/front/rear 三路（~240 Mbps 起），只在交换机/网卡
    带宽确认有余量时再开。

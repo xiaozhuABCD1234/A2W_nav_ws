@@ -23,6 +23,27 @@ Visualization Manager:
       Visual Enabled: true
       Collision Enabled: false
       Alpha: 1
+    # 点云（可选，默认关）：需在另一个终端跑桥 ros2 launch a2w_bridge a2w_bridge.launch.py
+    # 桥会发 base_link→a2w/lidar 等静态 TF（结构外参），所以能和机器人模型对齐；
+    # 若只想看点云用 ros2 launch a2w_bridge a2w_points_rviz.launch.py
+    - Class: rviz_default_plugins/PointCloud2
+      Name: a2w/points (可选)
+      Enabled: false
+      Topic:
+        Value: /a2w/points
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 2
+      Alpha: 1
+      Decay Time: 0.2
+      Position Transformer: XYZ
+      Color Transformer: AxisColor
+      Axis: Z
+      Autocompute Value Bounds: true
+      Use Fixed Frame: true
   Global Options:
     Fixed Frame: base_link
     Frame Rate: 30

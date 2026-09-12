@@ -3,13 +3,11 @@
   "log_level": "info",
   "status_topic": "a2w/status",
   "publish_status_period_sec": 5.0,
-
   "ros": {
     "isolate": true,
     "domain_id": 42,
     "fastdds_profile": "fastdds_iso.xml"
   },
-
   "collector": {
     "python": [
       ".venv-collector/bin/python",
@@ -22,14 +20,22 @@
     ],
     "port": 42610,
     "connect_timeout_sec": 60.0,
-    "restart_backoff_sec": [1.0, 2.0, 5.0, 10.0]
+    "restart_backoff_sec": [
+      1.0,
+      2.0,
+      5.0,
+      10.0
+    ]
   },
-
   "pointcloud": {
     "enabled": true,
     "mode": "single",
     "source": "front",
-    "failover_order": ["fused", "front", "rear"],
+    "failover_order": [
+      "fused",
+      "front",
+      "rear"
+    ],
     "stale_sec": 6.0,
     "topic": "a2w/points",
     "multi_topics": {
@@ -38,12 +44,16 @@
       "rear": "a2w/points_rear"
     },
     "frame_id": "a2w/lidar",
-    "fields": ["x", "y", "z", "intensity"],
+    "fields": [
+      "x",
+      "y",
+      "z",
+      "intensity"
+    ],
     "max_points": 0,
     "max_range": 0.0,
     "voxel": 0.0
   },
-
   "imu": {
     "enabled": true,
     "source": "auto",
@@ -54,36 +64,65 @@
       "lowstate": "a2w/imu_lowstate"
     },
     "frame_id": "a2w/imu",
+    "frames": {
+      "lidar_front": "a2w/lidar",
+      "lidar_rear": "a2w/lidar_rear",
+      "lowstate": "a2w/imu"
+    },
     "stale_sec": 2.0
   },
-
   "joints": {
     "enabled": true,
     "topic": "a2w/joint_states",
     "frame_id": "a2w/base",
     "names": [
-      "FR_hip", "FR_thigh", "FR_calf",
-      "FL_hip", "FL_thigh", "FL_calf",
-      "RR_hip", "RR_thigh", "RR_calf",
-      "RL_hip", "RL_thigh", "RL_calf",
-      "FR_wheel", "FL_wheel", "RR_wheel", "RL_wheel"
+      "FR_hip",
+      "FR_thigh",
+      "FR_calf",
+      "FL_hip",
+      "FL_thigh",
+      "FL_calf",
+      "RR_hip",
+      "RR_thigh",
+      "RR_calf",
+      "RL_hip",
+      "RL_thigh",
+      "RL_calf",
+      "FR_wheel",
+      "FL_wheel",
+      "RR_wheel",
+      "RL_wheel"
     ],
-    "indexes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    "indexes": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
   },
-
   "battery": {
     "enabled": false,
     "topic": "a2w/battery",
     "dds_topic": "rt/bms_state"
   },
-
   "sport_state": {
     "enabled": true,
     "topic": "a2w/sport_state",
     "dds_topic": "rt/sportmodestate",
     "rate_hz": 10.0
   },
-
   "sensors": {
     "slam_info": {
       "enabled": true,
@@ -99,15 +138,67 @@
       "frame_id": ""
     }
   },
-
   "tf": {
     "enabled": true,
     "transforms": [
-      { "parent": "a2w/base", "child": "a2w/lidar", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0] },
-      { "parent": "a2w/base", "child": "a2w/imu", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0] }
+      {
+        "parent": "base_link",
+        "child": "a2w/lidar",
+        "xyz": [
+          0.33767,
+          0.0,
+          0.08134
+        ],
+        "rpy": [
+          1.5707963,
+          0.0,
+          1.5707963
+        ]
+      },
+      {
+        "parent": "a2w/lidar",
+        "child": "a2w/lidar_rear",
+        "xyz": [
+          0.0,
+          0.00599,
+          -0.61764
+        ],
+        "rpy": [
+          3.1415927,
+          0.0,
+          3.1415927
+        ]
+      },
+      {
+        "parent": "base_link",
+        "child": "a2w/imu",
+        "xyz": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rpy": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "parent": "base_link",
+        "child": "a2w/base",
+        "xyz": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rpy": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
     ]
   },
-
   "display": {
     "enabled": true,
     "input_topic": "a2w/joint_states",

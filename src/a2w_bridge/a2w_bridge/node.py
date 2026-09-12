@@ -380,7 +380,11 @@ class A2WBridgeNode(Node):
         cfg = self.cfg["imu"]
         msg = Imu()
         msg.header.stamp = ros_time(_f(header.get("ts")))
-        msg.header.frame_id = self._frame_id(header, cfg["frame_id"])
+        # 每路源各自的坐标系（结构外参）：前雷达 IMU 在 a2w/lidar，**后雷达 IMU 在
+        # a2w/lidar_rear**（机器人把所有话题都标成 hesai_lidar，后 IMU 那个标是错的，
+        # 照搬会让后 IMU 的朝向差 180°），本体 IMU 在 a2w/imu。
+        frames = cfg.get("frames") or {}
+        msg.header.frame_id = self._frame_id(header, str(frames.get(key, "") or cfg["frame_id"]))
 
         quat = header.get("quat") or [0.0, 0.0, 0.0, 1.0]
         msg.orientation = quaternion(*quat[:4])

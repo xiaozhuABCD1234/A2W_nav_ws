@@ -20,11 +20,22 @@ Visualization Manager:
       Enabled: false
       Marker Scale: 0.4
       Show Names: true
-    # ===== 默认只显示融合点云（a2w/points）=====
-    # single 模式（桥的 pointcloud.mode=single + source=fused）下，全部点云都发在这一个话题上，
-    # 内容就是前后雷达的融合点云。同一条话题改名/改配色：选中本行后在右侧面板改。
+    # ===== 机器人模型（需要同时跑关节显示：ros2 launch a2w_bridge a2w_joint_display.launch.py）
+    # 默认关闭；想在点云里对照机身姿怂时勾上（用 /robot_description + 桥发的静态 TF）
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel (可选)
+      Enabled: false
+      Description Topic:
+        Value: /robot_description
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 0.6
+    # ===== 默认只显示 /a2w/points 这一项 =====
+    # single 模式下桥把**当前源**的点云都发在这一个话题上，内容由 JSON 的 pointcloud.source
+    # 决定（当前配置：front = 前雷达；也可设 fused = 前后融合、auto = 断流轮换）。
+    # 改配色/点大小：选中本行后在右侧面板改。
     - Class: rviz_default_plugins/PointCloud2
-      Name: a2w/points (fused)
+      Name: a2w/points (single 模式，源见 JSON)
       Enabled: true
       Topic:
         Value: /a2w/points
@@ -93,7 +104,9 @@ Visualization Manager:
     #   Color: 230; 140; 60
     #   Use Fixed Frame: true
   Global Options:
-    Fixed Frame: a2w/lidar
+    # base_link = 机器人本体（桥发 base_link→a2w/lidar→a2w/lidar_rear 静态 TF，
+    # 也用 URDF 的根，所以点云能和机器人模型叠着看）；改成 a2w/lidar 就是雷达视角
+    Fixed Frame: base_link
     Frame Rate: 30
     Background Color: 40; 40; 40
     Default Light: true
