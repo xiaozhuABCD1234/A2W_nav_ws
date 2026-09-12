@@ -1,0 +1,274 @@
+# a2w_bridge —— A2W 机器人数据 → ROS2 桥接
+
+把 Unitree A2W 机器人（PC2 上的 `slam_operate` 服务）发布的 DDS 数据转成**标准 ROS2 消息**：
+
+| 数据 | DDS 话题（机器人侧） | ROS2 话题（默认） | 消息类型 |
+| --- | --- | --- | --- |
+| 点云（融合/前/后） | `rt/unitree/slam_lidar/points{,1,2}` | `a2w/points` | `sensor_msgs/PointCloud2` |
+| 雷达 IMU | `rt/unitree/slam_lidar/imu{1,2}` | `a2w/imu` | `sensor_msgs/Imu` |
+| 本体 IMU（低电平） | `rt/lowstate` 内 `imu_state` | `a2w/imu`（降级源） | `sensor_msgs/Imu` |
+| **关节状态（16 关节）** | `rt/lowstate` 内 `motor_state` | **`a2w/joint_states`** | `sensor_msgs/JointState` |
+| **运控状态（只读）** | **`rt/sportmodestate`** | **`a2w/sport_state`** | `std_msgs/String`（JSON，限频10Hz） |
+| 电池（默认关） | `rt/bms_state` | `a2w/battery` | `sensor_msgs/BatteryState` |
+| SLAM 广播 | `rt/slam_info` / `rt/slam_key_info` | `a2w/slam_info` / `a2w/slam_key_info` | `std_msgs/String`（JSON 透传） |
+| 全局占据栅格 | `rt/unitree/slam_relocation/global_map` | `a2w/map/grid`（默认关） | `nav_msgs/OccupancyGrid` |
+| 机器人状态 | —（桥把 lowstate/bms 汇总） | `a2w/status` | `std_msgs/String`（JSON，默认 5 s） |
+| 静态 TF | — | `/tf_static` | base → lidar / imu（按配置） |
+
+所有话题时间戳用**采集端墙钟**统一打点；机器人自带时间戳只进日志不做时钟源。
+
+## ⚠️ ROS 域隔离（必读：不隔离会触发机器狗软急停）
+
+A2W 的 `192.168.123.0/24`（交换机1）是官方文档写明的**“DDS控制信号”局域网**。本机 ROS2
+默认用 FastDDS 域 0，会把发现组播 `239.255.0.1`（含类型对象）发到那张网卡；机器人侧是
+CycloneDDS 0.10.2，跨实现类型对象会让它出问题，运控随即落到**阻尼 ＝ 软急停**
+（官方 `error_code=1001`；`Damp()` 备注“该模式具有最高的优先级，用于突发情况下的急停”）。
+实测：不隔离时跑一条 `ros2 topic echo`，机器人网卡上就会加入 `239.255.0.1`。
+
+**本包默认已隔离**，两处生效：
+
+```bash
+# ① launch 自动给节点进程设好（取 JSON 的 ros.isolate / ros.domain_id）
+ros2 launch a2w_bridge a2w_bridge.launch.py
+
+# ② 你自己的终端要先 source 一次，否则不在同一 ROS 域，看不见 /a2w/* 话题
+source src/a2w_bridge/scripts/a2w_env.sh      # ROS_DOMAIN_ID=42 + FastDDS 只走回环
+ros2 topic echo /a2w/joint_states --once
+```
+
+验证隔离是否生效（机器人网卡上不应再出现 DDS 组播）：
+
+```bash
+ip maddr show enx00e04c2c4260 | grep 239.255.0.1     # 期望：无输出
+```
+
+> **为什么可以彻底隔离**：机器人数据不走 ROS2 DDS——采集器(CycloneDDS，只读订阅) → TCP →
+> ROS2 节点，ROS2 侧纯属本机消费，根本不需要碰机器人网络。
+> 也正因如此，`ROS_LOCALHOST_ONLY=1` 在本机 FastDDS 3.6 **实测不生效**（仍会绑机器人网卡），
+> 要用本包 `config/fastdds_iso.xml` 这份 profile 才行。
+
+## 关节（`a2w/joint_states`）
+
+A2W 是**轮足机器狗**：4 条腿 × (髋/大腿/小腿) + 4 个轮足电机 = **16 个自由度**。
+官方《A2 SDK 开发指南》的命名是 `Leg0=FR / 1=FL / 2=RR / 3=RL`，`Joint0=Hip / 1=Thigh / 2=Calf / 3=Wheel`。
+
+⚠️ **但 `rt/lowstate`（`unitree_hg/LowState`，35 槽）里的实际排列和那张命名表不是一回事**
+（本机在 A2W 上实测出来的）：
+
+```text
+idx 0..11 = 12 个腿关节，步长 3：0,1,2=FR 髋/大腿/小腿  3,4,5=FL  6,7,8=RR  9,10,11=RL
+idx 12..15 = 4 个轮足（GO2W/B2W 也是“腿关节在前、轮在后”，而不是每腿紧跟一个轮）
+```
+
+实测依据（静止、电机通电）：① 12 个腿关节的 q 全部落在官方限位内且左右髋镜像对称
+（`FR_hip=-0.5725 / FL_hip=+0.5778`，`RR_hip=-0.5784 / RL_hip=+0.5954`）；② 若按“每腿 4 个”
+读，FL/RR 组的 q 会超出髋/大腿/小腿限位 → 排除；③ `idx12~15` 的 τ 只有 ±0.018 N·m
+（腿部 ±0.4）、温度更低 → 轮足。
+
+- `position` ← `q`（弧度），`velocity` ← `dq`（rad/s），`effort` ← `tau_est`（N·m）
+- 随 lowstate 节奏发布（本机实测约 1 kHz），**与 IMU 选源解耦**：即使 IMU 降级到
+  lidar_front，关节照常出口
+- 默认出口 16 个关节；`joints.names` / `joints.indexes` 可改（例如只出 12 个腿关节）。
+  轮足内部顺序（12~15 各自对应哪条腿）官方文档没写，默认按腿序 FR/FL/RR/RL；
+  单独转一个轮、看哪个索引的 q 在变即可确认，然后改 `joints.indexes`，不用改代码
+- 想喂给 `a2w_description` 的 URDF（`left_front_joint1..4` 那套名字）时注意：
+  URDF 是 SolidWorks 导出，髋/大腿的**正负方向与 SDK 惯例相反**，不能只改名字就接线，
+  需要按关节做符号换算
+
+## 机器人状态（`a2w/status`）
+
+**不再是桥自身健康报告**；内容是机器人本体数据（std_msgs/String，JSON，默认 5 s）：
+
+```json
+{
+  "ts": 1789220268.06,        // 采集端墙钟
+  "mode_machine": 2,          // 低电平控制模式（原始值透传）
+  "mode_pr": 0,               // 模式优先级
+  "tick": 287393,             // lowstate 帧号
+  "joints": { "count": 16, "fresh_sec": 0.03 },   // 距上一帧 lowstate（-1=从未收到）
+  "sport": { "error_code": 1001, "name": "阻尼(软急停)", "fresh_sec": 0.01 },
+  "battery": null                                   // 默认关，开的话是 {voltage, current, soc, soh}
+}
+```
+
+其中 `sport.error_code` 是官方《运控服务接口 V2.0》里那套运动状态机：
+`0` 待机、`100` 灵动、**`1001` 阻尼（软急停）**、`1002` 站立锁定、`1013` 平衡站立、
+`1015` 常规行走…（完整表见 `a2w_bridge/dds_topics.py:SPORT_STATE_NAMES`）。
+状态**跳变**时采集器会额外发一条日志（1001 为 WARN），不用盯话题也能从 ROS 日志看到软急停发生。
+
+桥自身健康（当前点云源/IMU 源、各话题实测频率、队列深度）不再上话题，
+只打印在 ROS 日志里（采集器 stderr → 节点日志）。
+
+## 架构
+
+```
+┌─────────────────────────────── 机器(192.168.123.0/24) ───────────────────────────────┐
+│ PC2(192.168.123.162) unitree_slam.service：点云/IMU/里程计/栅格（标准 rosidl DDS 类型）│
+└──────────────┬────────────────────────────────────────────────────────────────────────┘
+               │ DDS 域 0（千兆网卡，点云 ~2.4 MB/帧）
+┌──────────────▼────────────────────────────────────────────────────┐
+│ 采集器 collector.py（Python 3.10 + cyclonedds 0.10.2 + unitree_sdk2py）│
+│   · 网卡/来源/传感器开关全部来自 JSON 配置                          │
+│   · 点云 BEST_EFFORT + KEEP_LAST(1)，同一时刻只订阅一个点云话题      │
+└──────────────┬────────────────────────────────────────────────────┘
+               │ 本机 TCP 帧（127.0.0.1:42610，JSON 头 + 二进制点云）
+┌──────────────▼────────────────────────────────────────────────────┐
+│ a2w_bridge_node（rclpy，ROS2 的 Python —— 本机为 3.14）              │
+│   · 采集器崩溃自动重启（退避 1/2/5/10 s）                           │
+│   · 发布上表全部标准消息 + 静态 TF                                  │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**为什么要两个进程**：`unitree_sdk2py` 依赖 `cyclonedds==0.10.2`（PyPI 只有 cp37~cp310 wheel），
+而本机 ROS2 Lyrical 的 `rclpy` 跑在 Python 3.14——两个依赖集无法共存于一个解释器。
+采集器进程专门用 3.10 venv（见下），ROS2 进程保持用系统 ROS2 Python。
+
+## 快速开始
+
+```bash
+# 0) 前置：连接机器人的网卡（192.168.123.0/24），例如 enx00e04c2c4260
+# 1) 一键创建采集器 3.10 venv（uv 自动下载 Python 3.10）
+bash src/a2w_bridge/scripts/setup_collector_venv.sh
+
+# 2) 编译安装
+cd /home/xiaozhu/Projects/A2W_nav_ws
+colcon build --packages-select a2w_bridge
+source install/setup.bash
+
+# 2.5) 隔离 ROS2 与机器人控制网（否则 ros2 CLI 可能触发机器狗软急停）
+source src/a2w_bridge/scripts/a2w_env.sh
+
+# 3) 启动（网卡/点云源等全部由 JSON 配置决定；隔离已由 launch 自动设好）
+ros2 launch a2w_bridge a2w_bridge.launch.py
+# 或指定自己的配置：
+ros2 launch a2w_bridge a2w_bridge.launch.py config:=/path/to/my.json
+
+# 4) 验证
+ros2 topic hz a2w/points a2w/imu
+ros2 topic echo /a2w/joint_states --once    # 16 关节（需机器人底层服务在跑）
+ros2 topic echo /a2w/status --once         # 运控状态机/关节新鲜度
+ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生效）
+```
+
+`unitree_sdk2py` 源码路径：`collector.sdk_path`（默认优先 `~/Downloads/unitree_sdk2_python`
+官方 SDK，回落 A2W-nav 的 vendor 拷贝）。官方 Python SDK 的 `sensor_msgs` 里没有
+`Imu_` 生成类（只有 C++ SDK 有 `unitree/idl/ros2/Imu_.hpp`），本包在
+`a2w_bridge/imu_idl.py` 里按 IDL 等价声明了 `Imu_`（`@final + @autoid(sequential)`，
+与本机实测匹配，~200 Hz 收数正常）。
+
+## 配置（config/a2w_bridge.json）
+
+所有行为由这份 JSON 决定，改完**重启节点**生效：
+
+| 键 | 可选值 / 默认 | 说明 |
+| --- | --- | --- |
+| `iface` | 如 `enx00e04c2c4260` | 连接机器人 192.168.123.0/24 的网卡（`ip -br addr` 查看），必填 |
+| `log_level` | `debug/info/warn/error` | 采集器日志级别 |
+| `collector.python` | 路径数组 | 采集器解释器候选，取第一个存在的 |
+| `collector.sdk_path` | 路径数组 | unitree_sdk2py 源码目录候选 |
+| `collector.port` | `42610` | 本机 TCP 端口（冲突时改） |
+| `pointcloud.enabled` | `true/false` | 是否收点云 |
+| `pointcloud.mode` | `single`（默认）/ `multi` | `single`=同一时刻只订阅一个点云话题；`multi`=同时收 fused/front/rear 发到 `multi_topics` |
+| `pointcloud.source` | `fused` / `front` / `rear` / `mapping` / `relocation` / **`auto`**（默认） | `single` 模式的点云源 |
+| `pointcloud.failover_order` | `["fused","front","rear"]` | `auto` 时的轮换顺序（无数据超过 `stale_sec` 换下一个） |
+| `pointcloud.stale_sec` | `6.0` | 多少秒收不到数据判定“断了” |
+| `pointcloud.topic` / `frame_id` | `a2w/points` / `a2w/lidar` | `single` 模式输出话题与坐标系 |
+| `pointcloud.fields` | `["x","y","z","intensity"]` | PointCloud2 输出字段（可加 `ring`/`timestamp`） |
+| `pointcloud.max_points` / `max_range` / `voxel` | `0`=关闭 | 每帧随机抽稀 / 距离裁剪（米）/ 体素下采样（米） |
+| `imu.enabled` | `true` | 是否发布 IMU |
+| `imu.source` | `auto`（默认，front→rear→lowstate 自动降级）/ `all`（三路各发各的话题）/ `lidar_front` / `lidar_rear` / `lowstate` | IMU 来源 |
+| `imu.topic` / `frame_id` | `a2w/imu` / `a2w/imu` | `auto` 与单源模式的输出话题 |
+| `imu.topics` | `{lidar_front, lidar_rear, lowstate}` | `all` 模式各自的输出话题 |
+| `joints.enabled` / `topic` / `frame_id` | `true` / `a2w/joint_states` / `a2w/base` | 关节状态开关/话题/坐标系 |
+| `joints.names` / `indexes` | 16 个（官方腿序 FR/FL/RR/RL × 髋/大腿/小腿/轮） | 关节名与 motor_state 槽位（实机对不上就改这里） |
+| `battery.enabled` / `topic` / `dds_topic` | `false`（默认关！） / `a2w/battery` / `rt/bms_state` | 电池（mV/mA 自动换成 V/A）。**默认关**：本机实测订阅 `rt/bms_state` 会让 CycloneDDS 0.10.2 约 25s 后段错误（固件侧 XTypes 类型不兼容），代码路径完整保留，待 SDK/固件问题解决后再开 |
+| `ros.isolate` / `domain_id` / `fastdds_profile` | `true` / `42` / `fastdds_iso.xml` | **ROS2 与机器人控制网的隔离**（见上一节）。`domain_id` 不能是 0，否则配置直接报错 |
+| `sport_state.enabled` / `topic` / `dds_topic` / `rate_hz` | `true` / `a2w/sport_state` / `rt/sportmodestate` / `10.0` | 只读运控状态机（1001=阻尼/软急停）；机器人侧 ~300 Hz，输出限频 |
+| `sensors.*.enabled` | 各传感器开关 | slam_info / slam_key_info / global_map |
+| `sensors.*.topic` | | 各传感器输出话题 |
+| `sensors.*.frame_id` | 留空=跟随机器人 | 非空则覆盖机器人消息里的 frame_id |
+| `tf.transforms` | base→lidar、base→imu（单位阵） | 静态 TF 列表，按实机安装尺寸改 `xyz`/`rpy`（弧度） |
+| `publish_status_period_sec` | `5.0` | 状态帧周期 |
+
+### ⚠️ 链路是最重要的约束（改动配置前必读）
+
+点云每帧 ~2.4 MB（23 万点），被切成上千个 IP 分片；机器人**对每个订阅者复制一份**。
+实测订阅 4 个点云话题会把千兆口打满（`Ip ReasmFails` 飙升 → 一帧都收不到）：
+小报文（sport/slam_info）正常、点云全丢的典型症状。
+
+因此：
+
+1. **`single` 模式一次只订阅一个点云话题**（默认）—— `auto` 会在当前源
+   `stale_sec` 无数据时自动轮换（实测融合源时有时无，`front` 通常最稳）；
+2. 点云 reader 固定 `BEST_EFFORT + KEEP_LAST(1)`：不触发重传、不积压历史帧；
+3. `multi` 模式会同时拉 fused/front/rear 三路（~240 Mbps 起），只在交换机/网卡
+   带宽确认有余量时再开。
+
+排查：`cat /sys/class/net/$IF/speed`；连续两次
+`cat /sys/class/net/$IF/statistics/rx_bytes` 看流量；
+`awk '/^Ip:/{print "InDelivers="$10, "ReasmFails="$17}' /proc/net/snmp` 看分片丢失。
+
+## 本机实测（2026-09，A2W-minipc / Lyrical）
+
+| 话题 | 频率 | 备注 |
+| --- | --- | --- |
+| `rt/unitree/slam_lidar/imu{1,2}` | ~200 Hz | 标准 `sensor_msgs/Imu`，含协方差 |
+| `rt/lowstate` | ~1 kHz（实测 1055 Hz） | 内含 imu_state + motor_state[35]（A2W 用 0~15） |
+| `rt/sportmodestate` | ~300 Hz（实测 300.4 Hz） | `error_code` = 运动状态机（1001=阻尼/软急停） |
+| `rt/slam_info` | ~5.5 Hz | JSON 广播 |
+| `rt/unitree/slam_lidar/points`（fused） | 间歇 | 时有时无，靠 auto 轮换兜底 |
+| `rt/unitree/slam_lidar/points1`（front） | ~2.4 Hz | 当前最稳 |
+| `rt/unitree/slam_lidar/points2`（rear） | 间歇 | 同上 |
+
+> ⚠️ `rt/lowstate` 只有机器人**低电平/底层服务在跑**时才发布（开机、运控服务运行时都在发）；
+> 正式关机/服务未起时会静默——此时 `a2w/status` 的 `joints.fresh_sec` 会一直增长，属正常。
+> 若 `ros2 topic hz /a2w/joint_states` 是 0 Hz，先看 `ros2 topic echo /a2w/status --once`
+> 的 `joints.fresh_sec` 是 -1（没收到 lowstate）还是有值（桥的问题）。
+>
+> 📐 关节槽位实测对照：静止时 `motor_state[0..11].q` 依次为
+> `-0.573, 1.060, -2.757 | 0.578, 1.062, -2.758 | -0.578, 1.065, -2.764 | 0.595, 1.059, -2.768`
+> —— 每三个一组正好是 髋(≈±0.58)/大腿(1.06)/小腿(−2.76，官方限位 −158°~−30°)，且左右髋镜像；
+> `idx12..15` 的 τ 只有 ±0.018 N·m → 4 个轮足。即 **0~11 腿关节（步长 3）+ 12~15 轮**。
+
+## 与官方 unitree_ros2 的关系
+
+官方 `unitree_ros2` 仓库走的是另一条路线：把整台机器的 RMW 换成 `rmw_cyclonedds_cpp`
+并用 `CYCLONEDDS_URI` 绑定网卡，让 ROS2 节点**直连**机器人 DDS。该路线官方只支持
+foxy/humble，与本机 Lyrical（默认 FastDDS）不兼容，且 A2W 的
+`rt/lowstate` 还需官方 `unitree_hg` 自定义消息包。
+本包选用 Python 采集器（复用 A2W-nav 已验证的 `unitree_sdk2py` + CycloneDDS 0.10.2 栈），
+对本机 ROS2 零侵入：其它节点（point_lio、rviz2 等）的 RMW/网卡配置完全不受影响。
+
+## 常见问题
+
+- **一执行 `ros2 topic echo …` 机器狗就进软急停（阻尼）** → 是 **ROS2(FastDDS) 与机器人控制网的
+  干扰**，不是你在做底层控制：`ros2 topic echo` 会让主机 DDS 域 0 的发现组播（239.255.0.1，
+  含类型对象）打到 `192.168.123.0/24` —— 官方写明的“DDS控制信号”网；机器人侧 CycloneDDS 0.10.2
+  遇到跨实现类型对象会出问题，运控随即落到阻尼（官方 `error_code` **1001** = 软急停）。
+  **修复：`source src/a2w_bridge/scripts/a2w_env.sh`**（launch 默认已对节点做同样隔离），
+  再用 `ip maddr show <机器人网卡> | grep 239.255.0.1` 确认无输出。
+  注意 `ROS_LOCALHOST_ONLY=1` 在本机 FastDDS 3.6 实测**无效**，要用包里的 `config/fastdds_iso.xml`。
+  监视是否再次发生：`ros2 topic echo /a2w/sport_state --once`（`error_code=1001` 就是软急停）。
+- **点云一个字节都收不到、但 IMU 正常** → 多半是链路被打满或网卡选错。
+  先 `ip -br addr` 确认 `iface`；再把 `pointcloud.mode` 保持 `single`、`source` 设 `auto`。
+- **`没有 cyclonedds` / Python 版本错误** → 采集器一定要用 3.10 venv：
+  `bash scripts/setup_collector_venv.sh`，并确认 `collector.python` 指向它。
+- **IMU 先有数据后消失** → `auto` 模式会自动降级；想看三路原始值用 `"source": "all"`。
+- **`/a2w/joint_states` 没数据 / `a2w/status` 里 `joints.fresh_sec` 是 -1** → 机器人的低电平
+  服务没在发 `rt/lowstate`（待机、关机、或运控服务没启动），不是桥的问题。
+- **关节名/位置对不上实机**（比如轮子槽位不对）→ 改 `joints.indexes`（0~34）与
+  `joints.names`，无需改代码；对照官方《A2 SDK 开发指南》about_a2w 的腿/关节序号。
+- **`a2w/battery` 没数据 / 打开会崩** → 默认就是关的。本机实测订阅 `rt/bms_state`
+  （unitree_hg/BmsState_）会让 CycloneDDS 0.10.2 约 25s 后 SIGSEGV
+  （`ddsi_xt_type_init_impl: invalid type object`，固件侧类型不兼容，已用对照实验确认：
+  关掉该订阅 90s 稳定，打开必崩）。等新版 cyclonedds 或确认固件类型后再开
+  （`battery.enabled: true`），代码路径已就绪。
+- **想要前后雷达同时进 ROS2** → `"mode": "multi"`（注意带宽约束，见上）。
+- **采集器偶发段错误重启（`采集器退出 (code=-11)`，日志里先出现
+  `dq.builtin: ... ddsi_xt_type_init_impl with invalid type object`）** → 属既存问题，
+  与关节/状态功能无关：单独跑采集器 60s+ 稳定；ROS2 节点和采集器同时跑时，
+  机器人侧周期性重新宣告的某个 XTypes 类型对象会让 CycloneDDS 0.10.2 崩（
+  推测为 rclpy FastDDS 与机器人 CycloneDDS 同在 domain 0/同网卡的发现干扰）。
+  节点已带自动重启（1/2/5/10s 退避），丢几秒数据就自行恢复；
+  彻底解决方向：升级 cyclonedds、给 ROS2 侧错开 domain（`ROS_DOMAIN_ID`），
+  或改成官方 C++ SDK 路线。

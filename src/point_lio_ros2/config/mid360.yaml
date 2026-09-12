@@ -1,0 +1,93 @@
+/**:
+    ros__parameters:
+        # LOCAL PATCH P2(见 docs/PATCHES.md):上游 mid360.yaml 无此两处改动
+        # tf 的 child frame。上游默认 "aft_mapped",但 /cloud_registered_body
+        # 的 header.frame_id 在 laserMapping.cpp 里是硬编码的 "body",
+        # 两者不一致 → octomap_server 用 lookupTransform(camera_init, body)
+        # 会直接失败(表现为 Message Filter dropping / Transform error)。
+        # 统一成 body。
+        odom_child_frame_id: "body"
+
+        common:
+            lid_topic: "/livox/lidar"
+            imu_topic: "/livox/imu"
+            con_frame: false # true: if you need to combine several LiDAR frames into one
+            con_frame_num: 1 # the number of frames combined
+            cut_frame: false # true: if you need to cut one LiDAR frame into several subframes
+            cut_frame_time_interval: 0.1 # should be integral fraction of 1 / LiDAR frequency
+            time_lag_imu_to_lidar: 0.0 # Time offset between LiDAR and IMU calibrated by other algorithms, e.g., LI-Init (find in Readme),
+            # the timestamp of IMU is transferred from the current timeline to LiDAR's timeline by subtracting this value
+
+        preprocess:
+            lidar_type: 1      # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR
+            scan_line: 4
+            timestamp_unit: 3   # the unit of time/t field in the PointCloud2 rostopic: 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
+            blind: 0.5
+
+        mapping:
+            imu_en: true
+            start_in_aggressive_motion: false # if true, a preknown gravity should be provided in following gravity_init
+            extrinsic_est_en: false # for aggressive motion, set this variable false
+            imu_time_inte: 0.005 # = 1 / frequency of IMU
+            satu_acc: 3.0 # the saturation value of IMU's acceleration. not related to the units
+            satu_gyro: 35.0 # the saturation value of IMU's angular velocity. not related to the units
+            acc_norm: 1.0 # 1.0 for g as unit, 9.81 for m/s^2 as unit of the IMU's acceleration
+            lidar_meas_cov: 0.01 # 0.001
+            acc_cov_output: 500.0
+            gyr_cov_output: 1000.0
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            imu_meas_acc_cov: 0.01 #0.1 # 2
+            imu_meas_omg_cov: 0.01 #0.1 # 2
+            gyr_cov_input: 0.01 # for IMU as input model
+            acc_cov_input: 0.1 # for IMU as input model
+            plane_thr: 0.1 # 0.05, the threshold for plane criteria, the smaller, the flatter a plane
+            match_s: 81.0
+            fov_degree: 360.0
+            det_range: 100.0
+            gravity_align: true # true to align the z axis of world frame with the direction of gravity, and the gravity direction should be specified below
+            gravity: [ 0.0, 0.0, -9.810 ] # [0.0, 9.810, 0.0] # gravity to be aligned
+            gravity_init: [ 0.0, 0.0, -9.810 ] # [0.0, 9.810, 0.0] # # preknown gravity in the first IMU body frame, use when imu_en is false or start from a non-stationary state
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1.0, 0.0, 0.0,
+                           0.0, 1.0, 0.0,
+                           0.0, 0.0, 1.0 ]
+
+        odometry:
+            publish_odometry_without_downsample: false
+
+        # ── 降采样(注意:这几项是**顶层**参数,不在 mapping/preprocess 命名空间下)──
+        # filter_size_surf:逐帧把扫描体素降采样后才送进逐点 EKF,同时决定
+        #   /cloud_registered(世界系点云)的密度 —— 它就是这份点云看着“稀/卡”的原因:
+        #   原先 yaml 没写这项,取代码默认 0.5 m,于是只有 ~900 点/帧
+        #   (而喂给 octomap 的 /cloud_registered_body 有 ~4300 点)。
+        #   0.5 → 0.25:密度约 2~4 倍,约束更足;代价是逐点更新数变多、CPU 上升一档。
+        # filter_size_map:ikd-Tree 地图体素尺寸,0.5 不动。
+        # 另两项同样是代码默认、yaml 未写:point_filter_num: 2(预处理抽点)、
+        #   space_down_sample: true(置 false 则 filter_size_surf 失效)。
+        # LOCAL PATCH P2(见 docs/PATCHES.md):上游 mid360.yaml 无此段。
+        filter_size_surf: 0.25
+        filter_size_map: 0.5
+
+        publish:
+            path_en: true                 # false: close the path output
+            scan_publish_en: true         # false: close all the point cloud output
+            scan_bodyframe_pub_en: true   # LOCAL PATCH P2:上游为 false;true 才会发 /cloud_registered_body
+            # ↑ 置 true 才会发 /cloud_registered_body(机体系点云)。
+            #   octomap_server 必须吃机体系点云:它把
+            #   lookupTransform(frame_id, cloud.frame_id) 的平移当作射线起点,
+            #   喂世界系的 /cloud_registered 会让射线全从世界原点射出,自由空间是错的。
+
+        pcd_save:
+            # LOCAL PATCH P6(见 docs/PATCHES.md 的 D 项):上游为 false。
+            # 为什么要开:先验点云是重定位/先验地图的前置资产,见 docs/LOCALIZATION.md 的 P0。
+            # 写盘时机:节点【正常退出】(Ctrl+C)时写一次 —— laserMapping.cpp:1358 在主循环之后,
+            #   kill -9 / 断电 / 崩溃 = 什么都不写。
+            # 写到哪里:ROOT_DIR/PCD/scans.pcd = src/point_lio_ros2/PCD/scans.pcd
+            #   (ROOT_DIR 是编译期烧进二进制的【源码】目录,不是 install/;*.pcd 已在 .gitignore)
+            # interval 为什么留 -1:实测 /cloud_registered 1532 点/帧 → pcl_wait_save 增长
+            #   ≈0.5 MB/s 内存、文件 ≈0.25 MB/s → 本机 11 GiB 空闲下,单文件在 ~40 min 内安全。
+            #   要跑长测再改 6000(10 min/文件);代价是产出多个 scans_<i>.pcd,喂 NDT 前得先合并。
+            pcd_save_en: true
+            interval: -1                 # how many LiDAR frames saved in each pcd file;
+            # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

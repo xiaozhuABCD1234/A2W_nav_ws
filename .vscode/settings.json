@@ -1,0 +1,13 @@
+{
+    "ROS2.distro": "lyrical",
+    "python.autoComplete.extraPaths": [
+        "/home/xiaozhu/Projects/A2W_nav_ws/build/a2w_bridge",
+        "/home/xiaozhu/Projects/A2W_nav_ws/install/a2w_bridge/lib/python3.14/site-packages",
+        "/opt/ros/lyrical/opt/gz_sim_vendor/lib/python",
+        "/opt/ros/lyrical/opt/gz_transport_vendor/lib/python",
+        "/opt/ros/lyrical/opt/sdformat_vendor/lib/python",
+        "/opt/ros/lyrical/opt/gz_msgs_vendor/lib/python",
+        "/opt/ros/lyrical/opt/gz_math_vendor/lib/python",
+        "/opt/ros/lyrical/lib/python3.14/site-packages"
+    ]
+}

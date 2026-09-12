@@ -1,0 +1,108 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+    CurrentViewClass: rviz_default_plugins/Orbit
+    Views:
+      - Class: rviz_default_plugins/Orbit
+        Name: Orbit
+        Distance: 10
+        Focal Point:
+          X: 0
+          Y: 0
+          Z: 0
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Plane: XY
+      Plane Cell Count: 20
+      Cell Size: 1
+      Color: 160; 160; 164
+      Line Style: Lines
+
+    # LIO 当前帧点云(世界系,已配准)
+    - Class: rviz_default_plugins/PointCloud2
+      Name: cloud_registered
+      Enabled: true
+      Topic:
+        Value: /cloud_registered
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: FlatColor
+      Color: 80; 220; 80
+
+    # LIO 全局累积地图(密集,点多了再开)
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Laser_map
+      Enabled: false
+      Topic:
+        Value: /Laser_map
+      Style: Points
+      Size (Pixels): 1
+      Color Transformer: FlatColor
+      Color: 200; 200; 200
+
+    # 轨迹
+    - Class: rviz_default_plugins/Path
+      Name: path
+      Enabled: true
+      Topic:
+        Value: /path
+      Color: 255; 80; 80
+      Buffer Length: 1
+
+    # octomap 着色:octomap_rviz_plugins 的 OccupancyGrid(subscribes /octomap_binary)。
+    # 之前退化成 FlatColor 橙色点云,是因为插件 .so 的 DT_NEEDED 里缺 liboctomap,
+    # rviz2(自己不加载 octomap)dlopen 时报 undefined symbol OcTreeStamped。实测预加载
+    # liboctomap.so.1.9.7 插件符号全部可解析 —— 已由 launch 里 rviz2 的
+    # LD_PRELOAD 解决。
+    # Voxel Coloring 三选一(插件源码 occupancy_grid_display.cpp):
+    #   Z-Axis          —— 按高度彩虹色(h=(1-z归一)*0.8,顶红底紫,与 octomap_server
+    #                      marker 同款),层次最清楚,默认选它;
+    #   Cell Probability —— setColor(1-p, p, 0):p→1 绿、p→0 红、0.5 暗黄。
+    #                      注意与本仓库其它显示相反(占据=绿);且 hit/max 参数下
+    #                      占据体素概率几乎都顶到 0.95 → 一片均匀亮绿。
+    #   Cell Color      —— 普通 OcTree 无效(报 Cannot extract color),只有 ColorOcTree 能用。
+    # Voxel Rendering: Occupied Voxels(只画占据)/ Free Voxels / All Voxels(加空闲,量大)。
+    - Class: octomap_rviz_plugins/OccupancyGrid
+      Name: OctomapGrid
+      Enabled: false
+      Topic:
+        Value: /octomap_binary
+      Voxel Rendering: Occupied Voxels
+      Voxel Coloring: Z-Axis
+      Voxel Alpha: 0.9
+      Max. Octree Depth: 16
+
+    # 备用:体素中心点云(FlatColor 橙色)。仅当插件仍加载失败时再启用。
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Octomap_fallback_points
+      Enabled: true
+      Topic:
+        Value: /octomap_point_cloud_centers
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 255; 140; 0
+
+    # 坐标系(只有 camera_init ↔ body 两条)
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 1
+
+  Global Options:
+    Fixed Frame: camera_init
+    Background Color: 20; 20; 20
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/Measure
+  Window Geometry:
+    Width: 1280
+    Height: 800

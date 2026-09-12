@@ -1,0 +1,8 @@
+{
+  "include": ["src"],
+  "exclude": ["build", "install", "log", ".venv-collector"],
+  "extraPaths": [
+    ".venv-collector/lib/python3.10/site-packages",
+    "/home/xiaozhu/Downloads/unitree_sdk2_python"
+  ]
+}

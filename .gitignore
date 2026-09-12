@@ -1,0 +1,52 @@
+# ---------- colcon / ROS 2 构建产物 ----------
+build/
+install/
+log/
+*_colcon_ws/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+.venv/
+.venv-*/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# ---------- ROS 数据 / 日志 ----------
+*.bag
+*.bag.active
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.pcd
+*.log
+results/
+
+# ---------- 编译器 / 工具产物 ----------
+compile_commands.json
+.clangd/
+.cache/
+*.o
+*.a
+
+# ---------- IDE ----------
+.vscode/browse.vc.db*
+.idea/
+cmake-build-debug/
+*.code-workspace
+
+# ---------- 系统 / 编辑器临时文件 ----------
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+*#
