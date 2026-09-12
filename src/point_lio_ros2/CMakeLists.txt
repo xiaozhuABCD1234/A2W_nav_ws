@@ -58,7 +58,42 @@ if(OPENMP_FOUND)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
 endif()
 
-find_package(PythonLibs REQUIRED) # Consider using Pybind11 for ROS2
+# ─── LOCAL PATCH P10(见 docs/PATCHES.md)─────────────────────────────────
+# 本机 ROS（Lyrical，ament_cmake 2.8.8）已经**删除** ament_target_dependencies 宏
+# （上游 point_lio 写于还在用它的年代），CMake 4 也删了 FindPythonLibs（CMP0148）。
+# 两处都在下面就地补齐，下游的依赖列表/语义不变。
+
+# 1) ament_target_dependencies 的等价实现：
+#    有 <dep>::<dep> imported target 就用它（rclcpp / tf2_ros / pcl_conversions…），
+#    否则退回 <dep>_INCLUDE_DIRS / _LIBRARIES / _DEFINITIONS 老变量
+#    （消息包 geometry_msgs / nav_msgs / sensor_msgs / visualization_msgs、
+#     以及 pcl_ros 现在仍然导出这些变量）。
+#    为什么不直接写成一堆 target_link_libraries：那样要逐包查目标名
+#    （pcl_ros 根本没有 pcl_ros::pcl_ros 这个聚合目标），改一个包就得改一处，
+#    而这个宏能跟上未来包导出方式的变化。
+macro(ament_target_dependencies target)
+  foreach(_dep ${ARGN})
+    if(TARGET ${_dep}::${_dep})
+      target_link_libraries(${target} ${_dep}::${_dep})
+    else()
+      if(DEFINED ${_dep}_INCLUDE_DIRS AND NOT "${${_dep}_INCLUDE_DIRS}" STREQUAL "")
+        target_include_directories(${target} PUBLIC ${${_dep}_INCLUDE_DIRS})
+      endif()
+      if(DEFINED ${_dep}_LIBRARIES AND NOT "${${_dep}_LIBRARIES}" STREQUAL "")
+        target_link_libraries(${target} ${${_dep}_LIBRARIES})
+      endif()
+      if(DEFINED ${_dep}_DEFINITIONS AND NOT "${${_dep}_DEFINITIONS}" STREQUAL "")
+        target_compile_definitions(${target} PUBLIC ${${_dep}_DEFINITIONS})
+      endif()
+    endif()
+  endforeach()
+endmacro()
+
+# 2) FindPythonLibs（CMake 4 已删）→ Python3；沿用老变量名，
+#    下面的 include_directories/target_link_libraries 都不用改。
+find_package(Python3 COMPONENTS Development REQUIRED)
+set(PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS})
+set(PYTHON_LIBRARIES ${Python3_LIBRARIES})
 find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 
 include_directories(

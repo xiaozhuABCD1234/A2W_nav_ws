@@ -1,0 +1,122 @@
+/**:
+    ros__parameters:
+        # ── A2W（宇树轮足狗）前雷达 JT128 → Point-LIO ────────────────────────────
+        #
+        # 数据源：a2w_bridge 的 /a2w/points（前雷达 points1）+ /a2w/imu（前雷达 imu1，196 Hz）。
+        # 桥侧必须用 config/a2w_bridge_lio.json 启动（它 extends a2w_bridge.json，只打开
+        # pointcloud.fields 的 ring/timestamp 并把 IMU 钉在前雷达那一路）。
+        #
+        # 为什么这份能直接用：机器人原始点云的字段布局**就是 Hesai ROS 驱动那一套** ——
+        #   偏移 0  x f4 | 4  y f4 | 8  z f4 | 12 intensity f4 | 16 ring u2 | 18 timestamp f8
+        #   point_step = 26，timestamp 是**绝对 Unix 秒**，帧内跨度 0.0998 s（10 Hz）。
+        # 与 point_lio 的 hesai_ros::Point（src/preprocess.h）逐字节一致，所以走 hesai 分支
+        # （lidar_type: 4）即可拿到**逐点时间**做运动补偿。
+        #
+        # 实测（2026-09 本机，A2W 实机）：
+        #   * 单帧 115200 点 = 128 线 × 900；其中 68.3% 是没回波的格子填的 (0,0,0)
+        #     → 桥侧 filter_zero 已丢（还剩 36548 有效点/帧）；
+        #   * 有效点里 19% 在 0.5 m 内且都聚在雷达周围 → 自车体回波，靠下面的 blind 丢；
+        #   * 距离分布：p25=1.7 m、中位 2.2 m、p100=9.4 m（室内）；
+        #   * IMU 是 m/s²（实测静止 |a|=9.85，重力在 +Y）→ acc_norm 必须 9.81，satu_acc 按 m/s² 给。
+        odom_child_frame_id: "body"
+
+        common:
+            lid_topic: "/a2w/points"
+            imu_topic: "/a2w/imu"
+            con_frame: false # true: combine several LiDAR frames into one
+            con_frame_num: 1
+            cut_frame: false # true: cut one LiDAR frame into several subframes
+            cut_frame_time_interval: 0.1
+            # ── 点云/IMU 的时间基准与固定滞后补偿 ─────────────────────────────
+            # 机器人自己的时钟与主机**差 263 s**（实测），所以桥统一用主机墙钟打点；
+            # 桥给点云打的是**帧首**时刻（用点云自带的逐点绝对时间反推，见 collector.py）。
+            # 剩下来的差就只是两路链路的延迟差：点云 3.0 MB/帧过千兆 + 上行、IMU 报文很小。
+            #
+            # 这个值不用猜：桥的周期状态行一直在量 —— 找收集器日志里的
+            #     “点云−IMU滞后差=+42ms（LIO: time_lag=-0.042）”
+            # 直接拄到本参数即可（实测量抖 32~49 ms，取中位）。下面是 2026-09 本机实测值。
+            # 参数定义：imu_t' = imu_t − 本值 → 要把 IMU 往后挪就用负值。
+            # 只影响动态精度（走起来才看得出），静止时与它无关。
+            time_lag_imu_to_lidar: -0.042
+
+        preprocess:
+            # 4 = HESAIxt32（preprocess.h: AVIA=1, VELO16=2, OUST64=3, HESAIxt32=4, UNILIDAR=5）
+            lidar_type: 4
+            scan_line: 128      # JT128：ring 实测 0~127
+            # 该分支**不用**这一项：hesai_handler 按“秒”硬编码 ×1000 换成 ms（curvature 单位 ms）。
+            # 保留是为了和其它雷达配置对照，以及 Velodyne/Ouster 分支复用本文件时不踩坑。
+            timestamp_unit: 0
+            # 自车体回波防护：实测有效点里 19% 落在 0.5 m 内、且都聚在雷达周围（腿/轮/机身），
+            # 不丢会被当成“随机器人移动的静止环境”。要走近身贴墙作业再往下调。
+            blind: 0.5
+
+        mapping:
+            imu_en: true
+            start_in_aggressive_motion: false # true 时用下面的 gravity_init 当先验重力
+            extrinsic_est_en: false # 激进运动下建议 false（本配置全程 false）
+            imu_time_inte: 0.005 # ≈ 1/196 Hz（实测 IMU 196.3 Hz，抖动 4.87~10 ms）
+            # 下面这两个是**原始 IMU 量纲**下的阈值：A2W 的 IMU 是 m/s²，
+            # 3 g ≈ 29.4 m/s²（若照搬 mid360 的 3.0，等于 0.3 g，正常走路都会被判饱和）。
+            satu_acc: 30.0
+            satu_gyro: 35.0
+            acc_norm: 9.81 # 1.0 = IMU 以 g 为单位；A2W 用 m/s²，所以必须 9.81
+            lidar_meas_cov: 0.01
+            acc_cov_output: 500.0
+            gyr_cov_output: 1000.0
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            imu_meas_acc_cov: 0.01
+            imu_meas_omg_cov: 0.01
+            gyr_cov_input: 0.01 # for IMU as input model
+            acc_cov_input: 0.1 # for IMU as input model
+            plane_thr: 0.1 # 平面判定阈值，越小越“平”才算平面
+            match_s: 81.0
+            fov_degree: 360.0   # JT128 水平 360°
+            det_range: 60.0     # JT128 量程（室内实际 p100 ≈ 9 m）
+            gravity_align: true # 把世界系 z 轴对齐到重力方向
+            gravity: [0.0, 0.0, -9.810]      # 世界系里的重力
+            gravity_init: [0.0, 0.0, -9.810] # 只在 start_in_aggressive_motion=true 时用
+            # 点云与 IMU **同坐标系**（都是前雷达 JT128 的内部 IMU/机体系，桥按源覆盖过
+            # frame_id：点云 a2w/lidar、imu1 a2w/lidar）→ 外参就是单位阵。
+            # 重新标定/换雷达挂载后：先改 a2w_bridge.json 的 tf.transforms，再改这里。
+            extrinsic_T: [0.0, 0.0, 0.0]
+            extrinsic_R: [1.0, 0.0, 0.0,
+                          0.0, 1.0, 0.0,
+                          0.0, 0.0, 1.0]
+
+        odometry:
+            publish_odometry_without_downsample: false
+
+        # ── 降采样（这几项是**顶层**参数，不在 mapping/preprocess 里）──────────────
+        # 实测（本机 2026-09，单帧 36548 有效点 → blind 后 29620）：
+        #   point_filter_num=3 时逐点循环约 9.9k 点/帧（98.7k pt/s）；
+        #   再过 filter_size_surf=0.25 的体素，约 590 点/帧进 EKF（5.9k pt/s）——
+        #   与 mid360 那套（~900 点/帧）同一量级，CPU 有富余。
+        # 想更密（结构化环境里约束更足）：filter_size_surf 降到 0.15~0.2；
+        # 想更省：point_filter_num 升到 4~6，或 filter_size_surf 升到 0.5。
+        filter_size_surf: 0.25
+        filter_size_map: 0.5
+
+        publish:
+            path_en: true
+            scan_publish_en: true
+            # true 才会发 /cloud_registered_body（机体系点云，octomap_server 必需：
+            # 它把 lookupTransform 的平移当射线起点，喂世界系点云会让自由空间全错）。
+            scan_bodyframe_pub_en: true
+
+        # ── 其余参数：上游是写在 launch 的参数字典里（会盖住 yaml，见 mapping_mid360 的
+        # LOCAL PATCH P5），本配置一律写进 yaml，让 yaml 成为唯一真相源。──────────────
+        use_imu_as_input: false # false = 以 IMU 为输出量测（与 mid360 配置一致）
+        prop_at_freq_of_imu: true
+        check_satu: true
+        init_map_size: 10
+        point_filter_num: 3 # 1 / 3 是上游建议值；A2W 单帧点数大，3 已够
+        space_down_sample: true # 置 false 则 filter_size_surf 失效
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+
+        pcd_save:
+            # 先验点云（重定位用）默认关：要用就 `pcd_save:=true` 起 launch，
+            # 只在节点**正常退出**（Ctrl+C）时写一次到 ./PCD/scans.pcd（相对启动目录）。
+            pcd_save_en: false
+            interval: -1
