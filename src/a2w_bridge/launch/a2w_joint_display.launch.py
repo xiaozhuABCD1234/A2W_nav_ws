@@ -2,12 +2,11 @@
 
 用法::
 
-    # 终端 A：先起桥（提供 /a2w/joint_states）
-    ros2 launch a2w_bridge a2w_bridge.launch.py
-    # 终端 B：再起显示
+    # 一条命令 = 桥 + URDF 关节显示 + RViz（+ base_footprint，默认都开）：
     source src/a2w_bridge/scripts/a2w_env.sh
     ros2 launch a2w_bridge a2w_joint_display.launch.py
     ros2 launch a2w_bridge a2w_joint_display.launch.py rviz:=false   # 只要 /tf，不开 RViz
+    ros2 launch a2w_bridge a2w_joint_display.launch.py bridge:=false  # 桥已另跑时
 
 数据流（全程只读，没有任何控制指令）::
 
@@ -21,7 +20,13 @@
     urdf          URDF 路径（默认 a2w_description/urdf/a2w_description.urdf）
     rviz          是否启动 RViz2（true/false，默认 true）
     rviz_config   RViz 配置（默认 a2w_description/urdf.rviz）
+    bridge        是否同时启动桥（默认 true）：一条命令 = 桥 + 关节显示 + footprint；
+                 桥已在别处跑时设 bridge:=false，避免采集器端口冲突
+    iface         随桥转发的网卡名覆盖（默认取 JSON 的 iface）
     relay         是否启动关节转发节点（默认取 JSON 的 display.enabled）
+    footprint     是否启动 base_footprint 节点（默认 true）：发动态
+                 base_footprint→base_link TF（z=实测离地高）与 2D 足迹
+                 话题 a2w/footprint（Nav2 定位/代价地图用，只读）
     input_topic   桥上 SDK 命名的关节话题（默认取 JSON 的 display.input_topic）
     output_topic  robot_state_publisher 订阅的话题（默认 joint_states）
     rate_hz       /joint_states 频率（默认取 JSON 的 display.rate_hz = 50）
@@ -37,11 +42,21 @@
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    LogInfo,
+)
 from launch.conditions import IfCondition
-from launch.substitutions import Command, LaunchConfiguration
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import (
+    Command,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+)
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.substitutions import FindPackageShare
 
 # 静态检查看不到这个导入（launch/ 目录不在包搜索路径），运行时由 ROS 环境提供：
 # 编译后 install 会把 a2w_bridge 包加到 PYTHONPATH，launch 进程可以直接 import。
@@ -116,6 +131,21 @@ def generate_launch_description() -> LaunchDescription:
                 default_value=",".join(disp["flip"]),
                 description='需要反号的 SDK 关节名，逗号分隔（例如 "FR_thigh,FL_thigh"）',
             ),
+            DeclareLaunchArgument(
+                "footprint",
+                default_value="true",
+                description="是否启动 base_footprint 节点（动态离地高 TF + 2D 足迹话题）",
+            ),
+            DeclareLaunchArgument(
+                "bridge",
+                default_value="true",
+                description="是否同时启动桥（一条命令 = 桥 + 显示 + footprint）",
+            ),
+            DeclareLaunchArgument(
+                "iface",
+                default_value="",
+                description="随桥转发的网卡名覆盖（默认取 JSON 的 iface）",
+            ),
             DeclareLaunchArgument("frame_prefix", default_value="", description="TF 前缀"),
             DeclareLaunchArgument(
                 "isolate",
@@ -134,6 +164,23 @@ def generate_launch_description() -> LaunchDescription:
             ),
             # 注意：必须在 DeclareLaunchArgument 之后，IfCondition 里的 'isolate' 才存在
             *isolation_actions(cfg, isolate, LaunchConfiguration("ros_domain_id")),
+            # 可选：把桥一起带上（默认带；bridge:=false 关掉、自己单跑桥）
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    PathJoinSubstitution([
+                        FindPackageShare("a2w_bridge"),
+                        "launch",
+                        "a2w_bridge.launch.py",
+                    ])
+                ),
+                condition=IfCondition(LaunchConfiguration("bridge")),
+                launch_arguments=[
+                    ("config", LaunchConfiguration("config")),
+                    ("iface", LaunchConfiguration("iface")),
+                    ("isolate", LaunchConfiguration("isolate")),
+                    ("ros_domain_id", LaunchConfiguration("ros_domain_id")),
+                ],
+            ),
             LogInfo(
                 msg=[
                     "[a2w] 显示真实关节: ",
@@ -142,8 +189,8 @@ def generate_launch_description() -> LaunchDescription:
                     LaunchConfiguration("output_topic"),
                     " @ ",
                     LaunchConfiguration("rate_hz"),
-                    " Hz（只读）。若一直没数据，先起桥: "
-                    "ros2 launch a2w_bridge a2w_bridge.launch.py",
+                    " Hz（只读）。本 launch 默认已带桥（bridge:=false 时需另起）；",
+                    "若一直没数据，检查桥是否在跑/机器人是否在线",
                 ]
             ),
             # 只做运动学：把 /joint_states 变成 /tf（不读写任何机器人接口）
@@ -184,6 +231,14 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                     }
                 ],
+            ),
+            # 动态 base_footprint：z=实测离地高（姿态自适应），+ 2D 足迹话题
+            Node(
+                package="a2w_bridge",
+                executable="a2w_base_footprint",
+                name="a2w_base_footprint",
+                output="screen",
+                condition=IfCondition(LaunchConfiguration("footprint")),
             ),
             Node(
                 package="rviz2",

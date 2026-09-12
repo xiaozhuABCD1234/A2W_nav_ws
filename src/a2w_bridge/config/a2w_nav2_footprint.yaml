@@ -1,0 +1,21 @@
+# A2W 2D 足迹（Nav2 footprint）—— 供未来 nav2 bringup 的 costmap 参数引用
+#
+# 来源：a2w_description/urdf/a2w_description.urdf 与 meshes/*.STL 实测（2026-09）：
+#   机身 base_link.STL     x ∈ [-0.328, +0.387]（长 0.715 m，含前后悬空）、y ∈ ±0.143
+#   轮胎 Link4.STL        半径 0.09486 m，胎宽 0.050 m（y 面距轮心 0.074 m）
+#   轮足零位（关节 0°）接地点 (±0.259, ±0.203)
+# 合成：x = 机身边界 ± 0.03 余量；y = 轮接地点 |y| + 胎宽一半(0.074) + 0.03 余量
+#
+# 📌 这是“零位/直腿参考姿态”的静态值；实际导航时用 a2w_base_footprint 节点在
+#    线按实时四轮接地点输出（话题 a2w/footprint，base_footprint 系），
+#    高度/姿态变化时足迹自动跟着变。改 URDF/换轮胎后重算：
+#    ros2 run a2w_bridge a2w_base_footprint --once --print-nav2
+#    （机器人不在线时输出零位参考值；在线时输出实时值）
+#
+# 坐标系：base_footprint（地面投影，z=0），逆时针，单位 m。
+# 用法：nav2 costmap 参数里写 footprint: [...]（或 robot_radius 圆近似）。
+footprint: [[-0.358, -0.307], [0.417, -0.307], [0.417, 0.307], [-0.358, 0.307]]
+
+# 建议：inflation_radius 取足迹半宽 + 0.1 左右（0.307 + 0.1 ≈ 0.41），
+# 机器人半径方向留 10 cm 膨胀余量；需要贴墙走再往下调（不小于 0.35）。
+inflation_radius: 0.45

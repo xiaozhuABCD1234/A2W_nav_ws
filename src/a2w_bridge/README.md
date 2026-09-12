@@ -271,13 +271,12 @@ idx 12..15 = 4 个轮足（GO2W/B2W 也是“腿关节在前、轮在后”，�
 把 `a2w_description` 的 URDF 按**实机关节角**动起来（纯只读，不发任何控制指令）：
 
 ```bash
-# 终端 A：桥（提供 a2w/joint_states）
-source src/a2w_bridge/scripts/a2w_env.sh
-ros2 launch a2w_bridge a2w_bridge.launch.py
-
-# 终端 B：显示（RViz）
+# 一条命令 = 桥 + 关节显示 + RViz + base_footprint（默认都开）：
 source src/a2w_bridge/scripts/a2w_env.sh
 ros2 launch a2w_bridge a2w_joint_display.launch.py
+
+# 桥已在别处跑时：只起显示/关节/足迹（避免采集器端口冲突）
+ros2 launch a2w_bridge a2w_joint_display.launch.py bridge:=false
 ```
 
 数据流（全部只读）：
@@ -315,6 +314,53 @@ rt/lowstate ─采集器(只 subscribe)─▶ /a2w/joint_states ─joint_relay�
   站立足实测 `base_link → left_front_Link4` = `[0.251, 0.154, -0.404]`
   （用 URDF 链手算 0.2508/0.1536/−0.4045）。
 - 只想要数据不要 RViz：`ros2 run a2w_bridge joint_relay`（可带 `-p rate_hz:=30.0`）。
+
+## base_footprint 与 2D 足迹（Nav2 定位/代价地图的坐标系基础）
+
+``base_footprint`` 是 REP-105 链 ``map → odom → base_footprint → base_link`` 里
+的“地面投影”坐标系。普通底盘把它写死在 URDF 里；**A2W 是轮足狗，base_link
+离地高度随姿态变（待机停放 ~0.10 m、站立更高），四轮接地点也随之移动**，所以
+必须按 TF 实时量、发动态变换：
+
+```bash
+# 与关节显示一起起（已默认带 footprint 节点）：
+ros2 launch a2w_bridge a2w_joint_display.launch.py
+# 单独跑 / 只看不给 RViz：
+ros2 run a2w_bridge a2w_base_footprint
+# 量一次 + 打印 Nav2 footprint 参数片段（无 TF 时输出 URDF 零位参考值）：
+ros2 run a2w_bridge a2w_base_footprint --once --print-nav2
+```
+
+节点输出（只读，不发任何控制指令）：
+
+1. **TF ``base_footprint → base_link``**：z = 实测离地高度（由四轮 mesh 最低点
+   经 TF 量得，公式同 `a2w_base_height`），base_footprint 始终贴地 —— RViz
+   的 Fixed Frame 改成 `base_footprint` 就能直观检查机器人是否“站在地面上”。
+2. **话题 ``a2w/footprint``**（PolygonStamped，base_footprint 系，逆时针矩形）：
+   2D 足迹 —— x 向取机身边界（base_link.STL 实测 ±0.328/+0.387，**含前后悬空**，
+   保守）、y 向取**实时**四轮接地点外侧 + 胎宽 + 余量（姿态变了足迹跟着变）。
+   RViz 里 Add → By topic → `/a2w/footprint` 可见。
+
+足迹实测几何（URDF/mesh 实测，2026-09）：
+
+| 项 | 值 | 来源 |
+| --- | --- | --- |
+| 轮胎半径 | 0.09486 m | `Link4.STL` bbox（z ±0.095） |
+| 胎宽 / y 面距轮心 | 0.050 / 0.074 m | `Link4.STL` bbox（y 0.024~0.074） |
+| 机身前后边界 | −0.328 / +0.387 m | `base_link.STL` bbox（长 0.715 m） |
+| 轮接地点（零位/直腿） | (±0.259, ±0.203) | URDF 零位 FK |
+| **零位参考足迹** | x∈[−0.358,+0.417]，y∈±0.307 | 上述 + 0.03 m 余量 |
+
+Nav2 参数片段已备好：`config/a2w_nav2_footprint.yaml`
+（含 footprint 与建议 inflation_radius=0.45；`--once --print-nav2` 可随时重算）。
+**改 URDF/换轮胎后重算**：起 joint display 后 `--once --print-nav2`（在线实时值），
+或离线时它自动用 URDF 零位 FK 计算（退出码 1 = 参考值，非实测）。
+
+> ⚠️ 与 `frame_prefix`：joint display 的 `frame_prefix` 会改 URDF 链的帧名，
+> 与 base_footprint 节点直接冲突 —— 导航场景不要用 prefix。
+>
+> KDL 提醒“root link base_link 有 inertia 建议加 dummy link”可忽略（FK 正常）；
+> A2W 的 base_footprint 是动态帧，不能像普通底盘那样靠加根 link 解决。
 
 ## 机器人状态（`a2w/status`）
 
