@@ -1,9 +1,10 @@
-"""A2W 一键：桥（LIO 配置）+ Point-LIO（+ 可选 RViz）。
+"""A2W 一键：桥（LIO 配置）+ Point-LIO + TF 桥接（+ 可选 RViz）。
 
     ros2 launch a2w_bridge a2w_lio.launch.py
     ros2 launch a2w_bridge a2w_lio.launch.py show_rviz:=false      # 只看话题/存 PCD
     ros2 launch a2w_bridge a2w_lio.launch.py pcd_save:=true        # 退出时落盘 ./PCD/scans.pcd
     ros2 launch a2w_bridge a2w_lio.launch.py lio:=false            # 只起桥（自己再起 LIO）
+    ros2 launch a2w_bridge a2w_lio.launch.py odom_tf:=false        # 不接机器人 TF 树
 
 数据流（全程只读，不下发任何控制指令）：
 
@@ -11,6 +12,13 @@
     rt/unitree/slam_lidar/imu1    ─采集器(只 subscribe)─▶ /a2w/imu   ─┴─▶ Point-LIO
                                                                         └─▶ /cloud_registered(_body)
                                                                             /path, TF: camera_init→body
+    a2w_odom_tf ─▶ TF: camera_init→base_footprint（把 LIO 位姿接进机器人 TF 树）
+
+``a2w_odom_tf`` 补的是``camera_init → base_footprint``这条边：没有它，LIO 的
+``camera_init → body`` 与机器人的 ``base_footprint → base_link → a2w/lidar``
+是**两棵互不相连的树**（RViz 放不到一起，Nav2 也拿不到 ``odom → base_footprint``）。
+它只读 TF、不需要机器人数据，所以在这里起最省事：LIO 一跑，树就连上。
+详见 README「把 LIO 位姿接进机器人 TF 树」。
 
 为什么默认用 ``config/a2w_bridge_lio.json``（extends 主配置）而不是主配置：
 Point-LIO 的 HESAI 分支要 ``ring(u2) + timestamp(f8)`` 两个字段（逐点时间去畸变），
@@ -29,6 +37,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
+    GroupAction,
     IncludeLaunchDescription,
     LogInfo,
     RegisterEventHandler,
@@ -53,6 +62,7 @@ from a2w_bridge.launch_common import (  # pyright: ignore[reportMissingImports]
 lio_config_name = "a2w_bridge_lio.json"   # 桥的 LIO 配置（share/a2w_bridge/config/ 下）
 start_bridge = True                       # 由本 launch 起桥；已在别处跑桥就设 false
 start_lio = True                          # 是否起 Point-LIO
+start_odom_tf = True                      # 是否补 TF 边 camera_init→base_footprint
 start_rviz = True                         # 是否起 RViz2
 ################### user configure parameters for ros2 end #####################
 
@@ -79,21 +89,30 @@ def _default_rviz_config() -> str:
     return ""
 
 
-def _lio_launch() -> IncludeLaunchDescription:
-    """point_lio 的 mapping_a2w.launch.py；RViz 由本 launch 起，所以给它 rviz:=false。"""
-    return IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(PathJoinSubstitution([
-            FindPackageShare("point_lio"),
-            "launch", "mapping_a2w.launch.py",
-        ])),
-        launch_arguments={
-            # 用 rviz:=false 而不是让 LIO 自己起 RViz：本 launch 要控制窗口生命周期
-            # （关 RViz = 全部退出）。注意 include 的 launch 参数会写进**共享**的
-            # launch_configurations，所以本文件自己的开关叫 show_rviz 不叫 rviz
-            # —— 同 mid360_bringup/mid360.launch.py 踩过的坑。
-            "rviz": "false",
-            "pcd_save": LaunchConfiguration("pcd_save"),
-        }.items(),
+def _lio_launch() -> GroupAction:
+    """point_lio 的 mapping_a2w.launch.py；RViz 由本 launch 起，所以给它 rviz:=false。
+
+    ⚠️ 套 GroupAction(scoped=True) 才安全：include 的 launch_arguments 是平铺的
+    SetLaunchConfiguration（不隔离作用域），这个 rviz:=false 会沿调用链往上写进
+    **调用方**的 `rviz` —— 谁在外面用 rviz:=true 起 RViz，谁就被它静默关掉
+    （a2w_nav2.launch.py 踩过：全链起来、RViz 一个进程都没有）。
+    本文件自己的开关叫 show_rviz 不叫 rviz 也是同一个原因
+    —— 同 mid360_bringup/mid360.launch.py 踩过的坑。
+    """
+    return GroupAction(
+        [IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(PathJoinSubstitution([
+                FindPackageShare("point_lio"),
+                "launch", "mapping_a2w.launch.py",
+            ])),
+            launch_arguments={
+                # 用 rviz:=false 而不是让 LIO 自己起 RViz：本 launch 要控制窗口生命周期
+                # （关 RViz = 全部退出）
+                "rviz": "false",
+                "pcd_save": LaunchConfiguration("pcd_save"),
+            }.items(),
+        )],
+        scoped=True,
         condition=IfCondition(LaunchConfiguration("lio")),
     )
 
@@ -144,6 +163,12 @@ def generate_launch_description() -> LaunchDescription:
                             "只在 Ctrl+C 正常退出时写 ./PCD/scans.pcd",
             ),
             DeclareLaunchArgument(
+                "odom_tf",
+                default_value=str(start_odom_tf).lower(),
+                description="是否补 TF 边 camera_init→base_footprint（把 LIO 位姿接进机器人 TF 树）。"
+                            "已有别的实例在发这条边就设 false（起两遍会让 TF 抖动）",
+            ),
+            DeclareLaunchArgument(
                 "show_rviz",
                 default_value=str(start_rviz).lower(),
                 description="是否启动 RViz2（关掉窗口 = 整个 launch 退出）",
@@ -187,6 +212,14 @@ def generate_launch_description() -> LaunchDescription:
                 ],
             ),
             _lio_launch(),
+            # 把 LIO 位姿接进机器人 TF 树（camera_init → base_footprint）
+            Node(
+                package="a2w_bridge",
+                executable="a2w_odom_tf",
+                name="a2w_odom_tf",
+                output="screen",
+                condition=IfCondition(LaunchConfiguration("odom_tf")),
+            ),
             rviz_node,
             # 关掉 RViz 窗口 = 整个 launch 退出
             RegisterEventHandler(

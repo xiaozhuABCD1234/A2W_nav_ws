@@ -1,0 +1,210 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+  - Class: rviz_common/Time
+    Name: Time
+  # Nav2 面板：导航状态、生命周期节点状态、已加载的地图/代价地图、当前目标
+  - Class: nav2_rviz_plugins/Navigation 2
+    Name: Navigation 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    # ===== 固定坐标系用 map（AMCL 发的 map → camera_init 是定位的关键）=====
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 40
+      Color: 90; 90; 90
+      Alpha: 0.3
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false
+      Marker Scale: 0.5
+      Show Names: true
+    # ===== 机器人本体（URDF 由 joint display 的 robot_state_publisher 提供，
+    #        姿态按实机关节角；base_footprint 贴地，z 随站/蹲变化）=====
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 0.8
+    # ===== 静态地图（a2w_pcd_to_map 生成的 pgm/yaml，经 map_server）=====
+    - Class: rviz_default_plugins/Map
+      Name: Map (静态)
+      Enabled: true
+      Topic:
+        Value: /map
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Alpha: 0.7
+      Color Scheme: map
+      Draw Behind: true
+    # ===== 代价地图（rviz 自带 Map 显示 + costmap 配色；比 nav2 的 Costmap 显示少依赖）=====
+    - Class: rviz_default_plugins/Map
+      Name: Costmap 全局
+      Enabled: true
+      Topic:
+        Value: /global_costmap/costmap
+        Depth: 1
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Alpha: 0.4
+      Color Scheme: costmap
+    - Class: rviz_default_plugins/Map
+      Name: Costmap 局部
+      Enabled: true
+      Topic:
+        Value: /local_costmap/costmap
+        Depth: 1
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+      Alpha: 0.5
+      Color Scheme: costmap
+    # ===== 2D 扫描（前向 180°！后半圈天然是空的，别以为出错了）=====
+    - Class: rviz_default_plugins/LaserScan
+      Name: scan (前向 180°)
+      Enabled: true
+      Topic:
+        Value: /scan
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 3
+      Color: 0; 255; 0
+      Color Transformer: FlatColor
+      Size (m): 0.05
+      Alpha: 1
+    # ===== 过滤云（宽带 − 自车体）：低于扫描带的障碍在这一路里 =====
+    - Class: rviz_default_plugins/PointCloud2
+      Name: points_nav (过滤云)
+      Enabled: false
+      Topic:
+        Value: /a2w/points_nav
+        Depth: 3
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: AxisColor
+      Alpha: 0.8
+    # ===== 原始前雷达点云（对不上时用它排查）=====
+    - Class: rviz_default_plugins/PointCloud2
+      Name: a2w/points (原始)
+      Enabled: false
+      Topic:
+        Value: /a2w/points
+        Depth: 3
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: AxisColor
+      Alpha: 0.6
+    # ===== 2D 足迹（a2w_base_footprint 发，base_footprint 系）=====
+    - Class: rviz_default_plugins/Polygon
+      Name: 足迹 (a2w/footprint)
+      Enabled: true
+      Topic:
+        Value: /a2w/footprint
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Color: 255; 170; 0
+      Alpha: 1
+    # ===== 全局路径（planner）/ 局部轨迹（controller）=====
+    - Class: rviz_default_plugins/Path
+      Name: 全局路径 /plan
+      Enabled: true
+      Topic:
+        Value: /plan
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Color: 0; 170; 255
+      Line Style: Lines
+    - Class: rviz_default_plugins/Path
+      Name: 局部轨迹 /local_plan
+      Enabled: true
+      Topic:
+        Value: /local_plan
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Color: 255; 0; 255
+      Line Style: Lines
+    # ===== AMCL 粒子云 + 定位位姿 =====
+    - Class: nav2_rviz_plugins/ParticleCloud
+      Name: AMCL 粒子
+      Enabled: true
+      Topic:
+        Value: /particle_cloud
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+    - Class: rviz_default_plugins/PoseWithCovariance
+      Name: AMCL 位姿
+      Enabled: true
+      Topic:
+        Value: /amcl_pose
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Color: 255; 255; 0
+      Alpha: 1
+      Shape: Arrow
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    # 2D Pose Estimate：定/纠初始位姿（发 /initialpose）
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+    # 2D Goal Pose：发导航目标（Nav2 的 GoalTool，走 /goal_pose → bt_navigator）
+    - Class: nav2_rviz_plugins/GoalTool
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Target Frame: <Fixed Frame>
+      Distance: 10
+      Focal Point: [0, 0, 0]
+      Yaw: 2.35
+      Pitch: -0.6
+Window Geometry:
+  Height: 900
+  Width: 1500
+  Displays:
+    collapsed: false
+  Navigation 2:
+    collapsed: false
+  Views:
+    collapsed: false

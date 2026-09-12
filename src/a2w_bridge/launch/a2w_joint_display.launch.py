@@ -44,6 +44,7 @@
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    GroupAction,
     IncludeLaunchDescription,
     LogInfo,
 )
@@ -165,21 +166,28 @@ def generate_launch_description() -> LaunchDescription:
             # 注意：必须在 DeclareLaunchArgument 之后，IfCondition 里的 'isolate' 才存在
             *isolation_actions(cfg, isolate, LaunchConfiguration("ros_domain_id")),
             # 可选：把桥一起带上（默认带；bridge:=false 关掉、自己单跑桥）
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    PathJoinSubstitution([
-                        FindPackageShare("a2w_bridge"),
-                        "launch",
-                        "a2w_bridge.launch.py",
-                    ])
-                ),
+            # ⚠️ scoped=True：include 的 launch_arguments 是平铺的 SetLaunchConfiguration
+            #    （不隔离作用域），不套的话 config/iface/isolate 这些会写进**调用方**
+            #    的 launch_configurations，把同名开关盖掉（a2w_nav2.launch.py 的
+            #    rviz 就是这么被静默关掉的）。
+            GroupAction(
+                [IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        PathJoinSubstitution([
+                            FindPackageShare("a2w_bridge"),
+                            "launch",
+                            "a2w_bridge.launch.py",
+                        ])
+                    ),
+                    launch_arguments=[
+                        ("config", LaunchConfiguration("config")),
+                        ("iface", LaunchConfiguration("iface")),
+                        ("isolate", LaunchConfiguration("isolate")),
+                        ("ros_domain_id", LaunchConfiguration("ros_domain_id")),
+                    ],
+                )],
+                scoped=True,
                 condition=IfCondition(LaunchConfiguration("bridge")),
-                launch_arguments=[
-                    ("config", LaunchConfiguration("config")),
-                    ("iface", LaunchConfiguration("iface")),
-                    ("isolate", LaunchConfiguration("isolate")),
-                    ("ros_domain_id", LaunchConfiguration("ros_domain_id")),
-                ],
             ),
             LogInfo(
                 msg=[

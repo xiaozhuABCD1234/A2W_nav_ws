@@ -322,9 +322,9 @@ rt/lowstate ─采集器(只 subscribe)─▶ /a2w/joint_states ─joint_relay�
 ## base_footprint 与 2D 足迹（Nav2 定位/代价地图的坐标系基础）
 
 ``base_footprint`` 是 REP-105 链 ``map → odom → base_footprint → base_link`` 里
-的“地面投影”坐标系。普通底盘把它写死在 URDF 里；**A2W 是轮足狗，base_link
-离地高度随姿态变（待机停放 ~0.10 m、站立更高），四轮接地点也随之移动**，所以
-必须按 TF 实时量、发动态变换：
+的“地面投影”坐标系（**odom 那条边由下一节的 `a2w_odom_tf` 补上**）。普通底盘把它
+写死在 URDF 里；**A2W 是轮足狗，base_link 离地高度随姿态变（待机停放 ~0.10 m、
+站立更高），四轮接地点也随之移动**，所以必须按 TF 实时量、发动态变换：
 
 ```bash
 # 与关节显示一起起（已默认带 footprint 节点）：
@@ -365,6 +365,145 @@ Nav2 参数片段已备好：`config/a2w_nav2_footprint.yaml`
 >
 > KDL 提醒“root link base_link 有 inertia 建议加 dummy link”可忽略（FK 正常）；
 > A2W 的 base_footprint 是动态帧，不能像普通底盘那样靠加根 link 解决。
+
+## 把 LIO 位姿接进机器人 TF 树（`a2w_odom_tf`）
+
+### 问题：两棵互不相连的树
+
+补这条边之前，机器人相关的 TF 分成两半（`tf2_echo` 实测报错）：
+
+```text
+$ ros2 run tf2_ros tf2_echo camera_init a2w/lidar_rear
+[INFO] ... Could not find a connection between 'camera_init' and 'a2w/lidar_rear'
+       because they are not part of the same tree. Tf has two or more unconnected trees.
+```
+
+```text
+# 子树 1：LIO（point_lio 发，10 Hz）
+camera_init ──▶ body                  # body = 前雷达系（LIO 外参是单位阵）
+
+# 子树 2：机器人（桥的静态外参 + a2w_base_footprint）
+base_footprint ──▶ base_link ──▶ a2w/lidar ──▶ a2w/lidar_rear
+                           ├──▶ a2w/imu
+                           └──▶ （URDF 各腿，robot_state_publisher 发）
+```
+
+后果：RViz 里机器人和点云/轨迹（`/cloud_registered`、`/path` 都在 `camera_init` 系）
+放不进同一棵树；Nav2 也拿不到 REP-105 要求的 `odom → base_footprint`。
+
+`a2w_odom_tf` 只补**一条边**，整棵树立刻连通：
+
+```text
+camera_init ──(LIO)──────────▶ body
+     │
+     └──(a2w_odom_tf)──▶ base_footprint ──▶ base_link ──▶ a2w/lidar ──▶ a2w/lidar_rear
+                                                      ├──▶ a2w/imu
+                                                      └──▶ （URDF 各腿）
+```
+
+### TF 树一览（谁发哪条边 —— 下游按这张表取帧）
+
+| 边 | 谁发 | 频率 | 语义 |
+| --- | --- | --- | --- |
+| `camera_init → body` | point_lio | 10 Hz | LIO 世界系 → 前雷达系（= 里程计位姿） |
+| **`camera_init → base_footprint`** | **`a2w_odom_tf`（本节点）** | ≈10 Hz（跟 LIO 帧，去重不发重复时间戳） | **REP-105 的 `odom → base_footprint`** |
+| `base_footprint → base_link` | `a2w_base_footprint` | 10 Hz | 纯 z 偏移 = 实测离地高（姿态自适应） |
+| `base_link → a2w/lidar`、`base_link → a2w/imu`、`a2w/lidar → a2w/lidar_rear` | 桥（按标定 JSON） | 静态 | 结构外参 |
+| `base_link → 各腿` | robot_state_publisher（`a2w_joint_display`） | 50 Hz | URDF + 实机关节角 |
+| `map → camera_init` | 留给定位层（AMCL / 机器人重定位） | — | **`camera_init` 就是本栈的 odom 系** |
+
+> 给 Nav2 / 定位层的约定：`odom_frame_id = camera_init`、
+> `base_frame_id = base_footprint`（或 `base_link` —— 两者只差一个 z，
+> `a2w/footprint` 与 `config/a2w_nav2_footprint.yaml` 里的 x/y 对二者通用）。
+> 不要再另发一个叫 `odom` 的帧：`camera_init` 本身就是那个角色，多一层别名
+> 会让后面 AMCL 发 `map → odom` 时父帧打架。
+
+### 怎么算的
+
+`body` 与 `a2w/lidar` 是**同一个物理坐标系**（喂给 LIO 的点云与 IMU 都是前雷达那一路，
+LIO 外参是单位阵），所以：
+
+```text
+T(camera_init→base_link) = T(camera_init→body) · T(body→base_link)
+T(body→base_link)        = inverse( T(base_link→a2w/lidar) )     # 桥发的静态外参
+```
+
+**不能把 `body` 直接当 `base_link` 用**：前雷达相对 base_link 有标定外参
+`xyz=[0.33767, 0, 0.08134]、rpy=[90°, 0, 90°]` —— 差一个平移**加**一个 90°/90°
+的安装旋转；不补偿的话机器人在 RViz 里会平移错 0.34 m、航向也错。
+
+算完再**压平成 2D**（base_footprint 是地面投影系）：
+
+- `x, y`：base_link 的横纵位置（竖直投影，REP-105）；
+- `z = z_base_link − 离地高`：落到**实地地面**上 —— 离地高就是
+  `a2w_base_footprint` 发的 `base_footprint → base_link` 那条边（狗蹲下/站立都不影响
+  这个关系）；拿不到那条边就退回 `z = 0`（= LIO 原点那个水平面，比真实地面高约
+  0.3 m，只影响 RViz 观感，不影响 Nav2）；
+- `roll/pitch` 归零、只留 `yaw`：2D 代价地图要的是平面位姿，机身俯仰是噪声。
+  这与 `a2w_base_footprint` 的“纯 z 偏移”约定一致 —— 压平后
+  `camera_init → base_footprint → base_link` 复合回去与 LIO 的位姿在 x/y/z 上一致。
+
+### 用法
+
+```bash
+# LIO 链路默认已带它（odom_tf:=true）：
+ros2 launch a2w_bridge a2w_lio.launch.py
+# 单独跑：
+ros2 run a2w_bridge a2w_odom_tf
+# 算一次、打印复合过程与自检就退出（排查 TF；无 LIO 时退出码 1）：
+ros2 run a2w_bridge a2w_odom_tf --once
+```
+
+验证：RViz 的 Fixed Frame 改成 `base_footprint`，能同时看到机器人和
+`/cloud_registered`、`/path` 就是连通了；或直接查跨树的一条：
+
+```bash
+ros2 run tf2_ros tf2_echo camera_init base_link    # 补边前报“两棵不相连的树”，补边后可查
+```
+
+- **整条边只能有一个实例发布**（起两遍会让 TF 抖动）：`odom_tf:=false` 关掉 launch 里那份。
+- 帧名都能换：`--odom-frame/--body-frame/--lidar-frame/--robot-frame/--footprint-frame`
+  （换雷达/改 `odom_child_frame_id` 时用；`--z-mode zero` 可强制 z 恒为 0）。
+- 它**只读 TF、只发这一条边**：不订阅话题、不碰机器人 DDS（与只读性、ROS 域隔离都不冲突）。
+- 断流保护：LIO 超 `--stale-sec`（默认 1 s）没更新就暂停发布并告警，
+  免得下游拿到一个定格的假位姿。
+
+### 本机实测（2026-09-13，无机器人；假 TF：LIO 位姿 + 桥的外参 + 离地高 0.24 m）
+
+给假 LIO 喂 `base_link` 在 `camera_init` 系的真值 `x=1.0 y=0.5 z=−0.08134 yaw=30°`
+（并按上面的外参反算 `body` 的位姿），`--once` 报告：
+
+```text
+LIO 位姿（body 在 camera_init 系）→ base_link：
+  T(body→base_link) 平移 = (-0.00000, -0.08134, -0.33767)（= −桥的 base_link→a2w/lidar 平移）
+  base_link 位姿 = x=+1.0000 y=+0.5000 z=-0.0813 rpy=(+0.00°, +0.00°, +30.00°)
+离地高（base_footprint→base_link 的 z）= 0.2400 m（实测）
+→ 发布 camera_init → base_footprint：x=+1.0000 y=+0.5000 z=-0.3213 yaw=+30.00°（roll/pitch 已归零）
+自检：把发布的边复合回去 x/y/z 最大误差 0.000000 m✓
+```
+
+即**完整还原了真值**（x/y/z/yaw 与手算一致，`z = −0.08134 − 0.24 = −0.32134` 落到地面）；
+补边后 `tf2_echo camera_init base_link` 也返回同一组数：
+`Translation [1.000, 0.500, -0.081]`、`RPY(degree) [0.000, -0.000, 30.000]`。
+降级路径也验过：缺 `base_footprint → base_link` 时告警一次并退回 z=0，`--z-mode zero` 正常。
+
+### 实机实测（2026-09-13，机器人静止在位；桥 / LIO / base_footprint 都在跑）
+
+补边前 `tf2_echo camera_init base_link` 报 `Tf has two or more unconnected trees`（实机复现）；
+补边后同一条查询返回 `Translation [0.01, 0.34, -0.09]`、`RPY(degree) [0.000, 0.000, -90.28]`，
+并用 LIO 原始里程计 `/aft_mapped_to_init` **手算复核一致**：
+
+| 量 | 实机值 | 说明 |
+| --- | --- | --- |
+| LIO 机体位姿（`/aft_mapped_to_init`） | `(0.003, 0.008, -0.002)`，绕 x ≈ 89° | 雷达系在 camera_init 系（静止，在原点附近） |
+| 桥外参 → `T(body→base_link)` | `(0, -0.08134, -0.33767)` | = −（`base_link→a2w/lidar` 的平移） |
+| ⇒ `base_link` 在 camera_init 系 | `(-0.001, 0.341, -0.089)`，yaw ≈ −90.3° | 与手算 `(0.003, 0.344, -0.089)` 一致（差几毫米漂移） |
+| 离地高（`base_footprint→base_link`） | 0.094 m（待机停放姿态） | ⇒ footprint z = −0.185（= LIO 系里的地面高度） |
+| 发布速率 | 8.3~9.6 Hz | 跟 LIO 帧（20 Hz 轮询 + 同时间戳去重） |
+
+> ⚠️ `camera_init` 的**朝向由 LIO 初始化时的雷达朝向决定**，与 `base_link` 差一个**常数**
+> （本机实测 yaw ≈ −90°、原点位置差 ≈ 0.34 m，都来自雷达安装方位）。这不影响导航
+> （`odom → base_footprint` 里带着它），但在 RViz 里对地图、或设 AMCL 初始位姿时要知道。
 
 ## 机器人状态（`a2w/status`）
 
@@ -455,10 +594,10 @@ PY
 
 本机实测（2026-09-13，A2W 实机）：
 
-* **`dry_run=true`**：`/cmd_vel` 的 `linear.x=5.0` 被夹到 `0.80`、`angular.z=-0.01` 被死区归零、
+- **`dry_run=true`**：`/cmd_vel` 的 `linear.x=5.0` 被夹到 `0.80`、`angular.z=-0.01` 被死区归零、
   按 10 Hz 下发、停发 0.62 s 后触发 `StopMove`；把 `block_codes` 设成机器人当前状态（0）后，
   一条指令都不再下发（状态门生效）；节点 SIGINT 后采集器日志出现「运动通道: 停止（桥关闭）」；
-* **`dry_run=false`**：实机下发 `Move()` 成功，机器人按 `/cmd_vel` 运动。
+- **`dry_run=false`**：实机下发 `Move()` 成功，机器人按 `/cmd_vel` 运动。
 
 `sport` 服务探活（只查 API 版本、不调任何运动接口）返回 `code=0 / version=1.0.0.1`，
 与本机 SDK 客户端版本一致 —— 调用前可用它确认机器人侧服务在线。

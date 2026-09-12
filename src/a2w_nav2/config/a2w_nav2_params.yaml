@@ -1,0 +1,361 @@
+# a2w_nav2 —— A2W（宇树轮足狗）2D 导航参数
+#
+# 坐标系约定（与 a2w_bridge 的 TF 接口一致，见 a2w_bridge/README.md「把 LIO 位姿接进机器人 TF 树」）：
+#   map          ← AMCL 发 map → camera_init
+#   camera_init  ← point_lio 的里程计世界系（**当 odom 用**，不要再另发叫 odom 的帧）
+#   base_footprint ← a2w_base_footprint 发的动态边（贴地，z=实测离地高）
+#   base_link → a2w/lidar …（桥的标定静态 TF，URDF 各腿挂在 base_link 下）
+#
+# A2W 特有的硬约束（都由**实机实测**得出，见 a2w_nav2/README.md）：
+#   1. 前雷达只有**前向 180°**，后方是盲区 → 禁倒车（min_vel_x=0、速度平滑下钳 0）、
+#      旋转限速；恢复动作里的盲退收到 0.10 m/0.05 m/s（见 behavior_trees/a2w_navigate_to_pose.xml）。
+#   2. 机身离地高度随姿态变（待机 0.094 m）→ 代价地图用 base_footprint（贴地）而不是 base_link。
+#   3. 足迹：实测待机姿态 [[-0.358,-0.341],[0.417,-0.341],[0.417,0.341],[-0.358,0.341]]（m）。
+#   4. 点云/里程计 7.8 Hz（实测，不是 10 Hz）→ 控制 10 Hz、代价地图 5 Hz 已经够，别盲目拉高。
+
+amcl:
+  ros__parameters:
+    # ── 坐标系 ──────────────────────────────────────────────────────────
+    global_frame_id: map
+    odom_frame_id: camera_init      # LIO 的世界系就当 odom（别再发 odom 帧，父子会打架）
+    base_frame_id: base_footprint
+    scan_topic: scan                # a2w_scan 出的 180° 扫描
+    tf_broadcast: true              # 发 map → camera_init
+
+    # ── 运动模型 ────────────────────────────────────────────────────────
+    # 轮足狗能横移（sport Move 有 vy），LIO 的里程计是完整 3 自由度 →
+    # 用 Omni 模型比 Differential 更贴合（导航本身不发 vy，但遥控横移时里程计是准的）。
+    robot_model_type: "nav2_amcl::OmniMotionModel"
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+
+    # ── 激光模型（量程与 a2w_scan 的 range_min/range_max 对齐）──────────
+    laser_model_type: "likelihood_field"
+    laser_max_range: 12.0
+    laser_min_range: 0.25
+    max_beams: 90                   # 361 束里抽 90 束做匹配（7.8 Hz 下 CPU 友好）
+    sigma_hit: 0.2
+    z_hit: 0.5
+    z_short: 0.05
+    z_max: 0.05
+    z_rand: 0.5
+    lambda_short: 0.1
+    laser_likelihood_max_dist: 2.0
+    do_beamskip: false
+    beam_skip_distance: 0.5
+    beam_skip_threshold: 0.3
+    beam_skip_error_threshold: 0.9
+
+    # ── 粒子滤波 ────────────────────────────────────────────────────────
+    min_particles: 500
+    max_particles: 2000
+    pf_err: 0.05
+    pf_z: 0.99
+    resample_interval: 1
+    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.0
+    random_seed: -1
+    save_pose_rate: 0.5
+    # 轮足狗原地踏步/机身晃动大：更新阈值别设太小，免得粒子被晃散
+    update_min_d: 0.15
+    update_min_a: 0.15
+    transform_tolerance: 1.0
+
+    # ── 初始位姿 ────────────────────────────────────────────────────────
+    # PCD 地图的原点 = 建图那一次的起点 → 每次把狗放在同一处开机时 (0,0,0) 就对。
+    # 放别处就在 RViz 里用 "2D Pose Estimate" 点一下（或把这里改成已知位姿）。
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+    always_reset_initial_pose: false
+    first_map_only: false
+
+map_server:
+  ros__parameters:
+    # yaml_filename 由 launch 传入（a2w_nav2.launch.py 的 map:=）
+    topic_name: map
+
+bt_navigator:
+  ros__parameters:
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: odom               # 由 a2w_odom_tf 发（camera_init → base_footprint）
+    bt_loop_duration: 10
+    filter_duration: 0.3
+    default_server_timeout: 20
+    default_cancel_timeout: 50
+    wait_for_service_timeout: 1000
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+      enable_groot_monitoring: false
+      groot_server_port: 1667
+      search_window: 2.0
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+      enable_groot_monitoring: false
+      groot_server_port: 1669
+      search_window: 2.0
+    # default_nav_to_pose_bt_xml 由 launch 传（指向本包的 A2W 专用树：收窄盲退）
+    error_code_name_prefixes:
+      - assisted_teleop
+      - backup
+      - compute_path
+      - drive_on_heading
+      - follow_path
+      - nav_thru_poses
+      - nav_to_pose
+      - smoother
+      - spin
+      - wait
+
+controller_server:
+  ros__parameters:
+    # ⚠️ Lyrical 的 nav2 默认 true（发 TwistStamped）。A2W 这条链上只能说 Twist：
+    #    a2w_bridge 的 motion 通道订的是 geometry_msgs/Twist（node.py 写死），
+    #    a2w_teleop 发的也是 Twist。两边类型不一致时 **DDS 不会建连、也不报错**
+    #    ——现象是“导航跑得好好的、狗一动不动”（看桥日志永久 motion 共 0 次）。
+    #    三个节点（controller/behavior/velocity_smoother）必须一起设 false，
+    #    否则中间那条 cmd_vel_nav 又会拆成两种类型。
+    enable_stamped_cmd_vel: false
+    controller_frequency: 10.0     # 点云/里程计 7.8 Hz，控制 10 Hz 合适（别拉高，CPU 要留给 LIO）
+    costmap_update_timeout: 0.30
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+    path_handler_plugins: ["PathHandler"]   # Nav2 1.5 新增，必须给
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.30   # 轮足狗启停有死区，比默认 0.5 松
+      movement_time_allowance: 20.0    # …时间也给宽一点（默认 10 s）
+    general_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true
+      xy_goal_tolerance: 0.15          # 足迹 0.68×0.76 m，15 cm 已够
+      yaw_goal_tolerance: 0.20
+      path_length_tolerance: 1.0
+    PathHandler:
+      plugin: "nav2_controller::FeasiblePathHandler"
+      prune_distance: 2.0
+      # 路径反向/原地掉头检查：本机器人按"只前进"跑，不强制反向/旋转
+      enforce_path_inversion: false
+      enforce_path_rotation: false
+      inversion_xy_tolerance: 0.2
+      inversion_yaw_tolerance: 0.4
+      minimum_rotation_angle: 0.785
+      reject_unit_path: false
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: true
+      # ── 速度约束（**禁倒车**就靠这里 + velocity_smoother 两道）──────────
+      min_vel_x: 0.0                  # 不许负 vx（后向盲区）
+      min_vel_y: 0.0
+      max_vel_x: 0.6                  # 官方走路低速档上限 0.8，导航先用 0.6
+      max_vel_y: 0.0                  # 先不横移；想开就设 0.3 并把 vy_samples 提到 5
+      max_vel_theta: 0.8              # 旋转限速（官方上限 2.0；盲区里转慢点）
+      min_speed_xy: 0.0
+      max_speed_xy: 0.6
+      min_speed_theta: 0.0
+      acc_lim_x: 0.8                  # 轮足狗起步/停车有死区，加速度给保守值
+      acc_lim_y: 0.0
+      acc_lim_theta: 1.5
+      decel_lim_x: -0.8
+      decel_lim_y: 0.0
+      decel_lim_theta: -1.5
+      # ── 采样/仿真 ──────────────────────────────────────────────────────
+      vx_samples: 20
+      vy_samples: 1                   # max_vel_y=0 时留 1 个采样即可
+      vtheta_samples: 40
+      sim_time: 1.7
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+      xy_goal_tolerance: 0.15
+      trans_stopped_velocity: 0.1
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      # ── critics（DWB 经典配置）────────────────────────────────────────
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      BaseObstacle.scale: 0.02
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.1
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.1
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: camera_init       # 局部代价地图在 odom 系里滚动
+      robot_base_frame: base_footprint
+      rolling_window: true
+      width: 4
+      height: 4
+      resolution: 0.05
+      footprint: "[[-0.358, -0.341], [0.417, -0.341], [0.417, 0.341], [-0.358, 0.341]]"
+      transform_tolerance: 0.3
+      plugins: ["voxel_layer", "inflation_layer"]
+      # ⚠️ 必须 true：Nav2 的 publishCostmap() 在 false 时**只发一次完整图**，
+      # 之后只给 <costmap>_updates 发增量（且要有人订阅那个话题）→ RViz 里代价地图一直是空的。
+      # 上游 nav2_params.yaml 默认也是 true。
+      always_send_full_costmap: true
+      # ⚠️ 高度类参数都是【代价地图坐标系（camera_init）里的绝对 z】，不是"离地高度"！
+      # camera_init 的 z=0 = 建图那一次 LIO 的原点 ≈ 雷达离地高度（≈0.185 m），
+      # 所以【地面在 camera_init 里≈ z=-0.185】。实测：不改这个，voxel 层会报
+      # "Sensor origin ... is out of map bounds ... 0.00 to ... 1.20"，清不掉旧障碍。
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: true
+        publish_voxel_map: false
+        origin_z: -0.40              # 把地面（z≈-0.185）包进体素网格
+        z_resolution: 0.05
+        z_voxels: 32                 # → z ∈ [-0.40, 1.20]（离地约 -0.22 ~ +1.38 m）
+        max_obstacle_height: 1.10    # ≈ 离地 1.29 m
+        mark_threshold: 0
+        observation_sources: scan nav_cloud
+        scan:
+          topic: scan
+          data_type: "LaserScan"
+          min_obstacle_height: -0.30   # ≈ 离地 0.10 m（扫描带实际从离地 0.30 m 起）
+          max_obstacle_height: 1.10    # ≈ 离地 1.29 m
+          clearing: true
+          marking: true
+          obstacle_max_range: 6.0     # 实测室内 p100 ≈ 9 m，取 6 m 足够且省 CPU
+          obstacle_min_range: 0.25
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.25
+        nav_cloud:
+          # a2w_scan 的宽带过滤云（已去掉自车体盒）：补"低于扫描带"的障碍
+          topic: a2w/points_nav
+          data_type: "PointCloud2"
+          min_obstacle_height: -0.30  # 同上：下面那条是 camera_init 绝对高度
+          max_obstacle_height: 1.10
+          clearing: true
+          marking: true
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.25
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.25
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.45        # 足迹半宽 0.34 + 0.11 余量
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_footprint
+      resolution: 0.05
+      footprint: "[[-0.358, -0.341], [0.417, -0.341], [0.417, 0.341], [-0.358, 0.341]]"
+      transform_tolerance: 0.3
+      track_unknown_space: true       # PCD 投影出来的图，未知区很多，要如实标坏
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: scan
+          data_type: "LaserScan"
+          # 同局部代价地图：这两个高度是 camera_init 系里的绝对 z（地面≈-0.185）
+          min_obstacle_height: -0.30
+          max_obstacle_height: 1.10
+          clearing: true
+          marking: true
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.25
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.25
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.45
+      # ⚠️ 必须 true：Nav2 的 publishCostmap() 在 false 时**只发一次完整图**，
+      # 之后只给 <costmap>_updates 发增量（且要有人订阅那个话题）→ RViz 里代价地图一直是空的。
+      # 上游 nav2_params.yaml 默认也是 true。
+      always_send_full_costmap: true
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0   # 全局规划 1 Hz 就够（BT 里也是 1 Hz）
+    costmap_update_timeout: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      tolerance: 0.25
+      use_astar: true                # 室内小图，A* 更快
+      allow_unknown: true            # PCD 投影图里有未知区，不许穿就基本没路可走
+
+behavior_server:
+  ros__parameters:
+    enable_stamped_cmd_vel: false    # 同 controller_server：只发 Twist（见那里的注释）
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+      acceleration_limit: 0.5
+      deceleration_limit: -0.5
+      minimum_speed: 0.05
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+      acceleration_limit: 0.5
+      deceleration_limit: -0.5
+      minimum_speed: 0.05
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    local_frame: camera_init
+    global_frame: map
+    robot_base_frame: base_footprint
+    transform_tolerance: 0.3
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 0.8          # 与 DWB 的 max_vel_theta 一致（盲区里转慢点）
+    min_rotational_vel: 0.25
+    rotational_acc_lim: 1.5
+
+velocity_smoother:
+  ros__parameters:
+    # 输入（cmd_vel_nav）和输出（cmd_vel）都必须是 Twist：出口要喂 a2w_bridge 的
+    # geometry_msgs/Twist 订阅。改 true 就是“导航空转、狗不动”。
+    enable_stamped_cmd_vel: false
+    smoothing_frequency: 10.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"            # 先把闭环关掉（odom 速度反馈依赖 /odom，见 README）
+    # ── 最后一道硬闸：vx/vy 都不许负（禁倒车），角速度也压在上限内 ──────
+    max_velocity: [0.6, 0.0, 0.8]
+    min_velocity: [0.0, 0.0, -0.8]
+    max_accel: [0.8, 0.0, 1.5]
+    max_decel: [-0.8, 0.0, -1.5]
+    odom_topic: odom
+    odom_duration: 0.1
+    deadband_velocity: [0.01, 0.0, 0.02]   # 死区：别让 1 mm/s 的指令去撩拨电机
+    velocity_timeout: 0.5

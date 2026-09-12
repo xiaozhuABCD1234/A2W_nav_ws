@@ -1,0 +1,43 @@
+# a2w_scan —— 前雷达 → 2D 扫描 + 导航用过滤云
+#
+# 所有高度都以**实时实测的机身离地高度 h** 为基准（h = TF base_footprint → base_link 的 z，
+# 由 a2w_base_footprint 节点量；待机停放 ≈ 0.094 m，站起来会变大）。
+# 实测依据（2026-09 实机，前向 180° 内 209542 点）：
+#   * 机身占地面以上 0.014~0.224 m（base_link.STL z∈[−0.080,+0.130] + h）
+#   * 自车体回波：z∈[0.20,0.30) 有 35% 落在 r∈[0.15,0.6]；z≥0.30 起 0 点
+#   * 天花板在 2.2 m（占前向 29.5%）→ 上沿必须压住
+# 所以扫描带下沿取 h+0.21（≈0.30 m 离地）——实测该带内 r<0.6 m 一个点都没有。
+a2w_scan:
+  ros__parameters:
+    # ── 输入/输出 ────────────────────────────────────────────────────────
+    cloud_topic: /a2w/points          # 桥的前雷达点云（前向 180°）
+    scan_topic: scan                  # LaserScan（AMCL + 代价地图都订它）
+    cloud_out_topic: a2w/points_nav   # 过滤云（voxel 层用；publish_cloud=false 则不建发布者）
+    publish_cloud: true
+
+    # ── 坐标系 ──────────────────────────────────────────────────────────
+    target_frame: base_footprint       # 扫描/点云的输出坐标系（贴地，z=离地高度）
+    body_frame: base_link              # 量 h 用的帧（TF base_footprint → base_link 的 z）
+
+    # ── 高度带（相对 h 的偏移，m）───────────────────────────────────────
+    band_low_above_body: 0.21          # 扫描带下沿 = h + 0.21（实测无自车体回波）
+    band_high_above_body: 1.00         # 扫描带上沿 = h + 1.00（天花板 2.2 m，留足余量）
+    cloud_min_height: 0.10             # 过滤云下沿 = 离地 0.10 m（地面 z≈0，直接切掉）
+    cloud_high_above_body: 1.00        # 过滤云上沿 = h + 1.00
+
+    # ── 自车体掩膜盒（base_footprint 系；默认 = a2w_base_footprint 实测足迹）──
+    # 只对过滤云生效：扫描带本身已经干净，再加掩膜会把贴着车身的真障碍也切掉。
+    self_mask_x_min: -0.358            # 机身后边界（含悬空）
+    self_mask_x_max: 0.417             # 机身前边界
+    self_mask_y: 0.341                 # 轮外沿 + 余量（实测待机姿态）
+    self_mask_z_above_body: 0.130      # 掩膜上表面 = h + 0.130（机身上表面）
+    self_mask_margin: 0.05             # 三向余量
+
+    # ── 扫描几何（前向 180°，实测前雷达就这个视场）─────────────────────
+    angle_min: -1.5707963              # −90°（右手侧）
+    angle_max: 1.5707963               # +90°（左手侧）
+    angle_increment: 0.00872665        # 0.5° → 361 束
+    range_min: 0.25                    # 小于它当作自车体/噪声
+    range_max: 12.0                    # 与 AMCL 的 laser_max_range 保持一致
+
+    status_period: 5.0                 # 状态行周期（秒；0=关）

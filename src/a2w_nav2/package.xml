@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>a2w_nav2</name>
+  <version>0.1.0</version>
+  <description>
+    A2W（宇树轮足狗）2D 导航：前雷达点云 → LaserScan/过滤云（a2w_scan）、
+    Point-LIO 的 PCD → 2D 占据栅格（a2w_pcd_to_map）、Nav2 组合式 bringup 与 A2W 定制参数。
+  </description>
+  <maintainer email="xiaozhuABCD1234@163.com">xiaozhu</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- 运行期依赖：ROS 侧 -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <!-- Nav2 组件（Lyrical 1.5.1；没有 nav2_bringup 元包，所以逐个列） -->
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>
+  <exec_depend>nav2_planner</exec_depend>
+  <exec_depend>nav2_bt_navigator</exec_depend>
+  <exec_depend>nav2_behaviors</exec_depend>
+  <exec_depend>nav2_velocity_smoother</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_costmap_2d</exec_depend>
+  <exec_depend>nav2_navfn_planner</exec_depend>
+  <exec_depend>nav2_dwb_controller</exec_depend>
+  <exec_depend>nav2_rviz_plugins</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- 上游链路（桥提供点云/IMU/TF；本包不直接调它，但一键 launch 会 include 它） -->
+  <exec_depend>a2w_bridge</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

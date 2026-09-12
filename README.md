@@ -4,8 +4,8 @@ ROS2 (Lyrical) 工作空间,当前包含:
 
 | 包 | 内容 | 状态 |
 | --- | --- | --- |
-| `a2w_bridge` | **A2W 机器人 → ROS2 桥接**:点云 / IMU / 关节状态(16 关节含轮足) / 电池 / SLAM 广播 / 栅格,全部标准 ROS2 消息,行为由 JSON 配置(网卡、点云源 fused/front/rear、IMU 源等);**含一条命令把点云喂给 Point-LIO 的 `a2w_lio.launch.py`;**动态 `base_footprint` TF 与 2D 足迹(`a2w_base_footprint`,Nav2 定位/代价地图用);**含唯一的运动通道 `/cmd_vel` → `sport_client.Move`(默认关,带阻尼状态门/看门狗/限幅)** | ✅ 本机实测可用 |
-| `a2w_teleop` | Xbox 手柄 → `/cmd_vel`(ROS 2 自带 `joy` + `teleop_twist_joy`,无自定义节点);打开桥的运动通道后才真正驱动机器人 | 新增 |
+| `a2w_bridge` | **A2W 机器人 → ROS2 桥接**:点云 / IMU / 关节状态(16 关节含轮足) / 电池 / SLAM 广播 / 栅格,全部标准 ROS2 消息,行为由 JSON 配置(网卡、点云源 fused/front/rear、IMU 源等);**含一条命令把点云喂给 Point-LIO 的 `a2w_lio.launch.py`;**动态 `base_footprint` TF 与 2D 足迹(`a2w_base_footprint`,Nav2 定位/代价地图用);**把 LIO 位姿接进机器人 TF 树(`a2w_odom_tf`,`camera_init → base_footprint`,本栈的 odom 系就是 `camera_init`)**;**含唯一的运动通道 `/cmd_vel` → `sport_client.Move`(默认关,带阻尼状态门/看门狗/限幅)** | ✅ 本机实测可用 |
+| `a2w_teleop` | Xbox 手柄 → `/cmd_vel`(ROS 2 自带 `joy` + `teleop_twist_joy`,无自定义节点);打开桥的运动通道后才真正驱动机器人。**仅用于导航未就绪时调试能否手动控制;导航跑起来后不需要它,避免与 Nav2 抢 `/cmd_vel`**(详见 [`src/a2w_teleop/README.md`](src/a2w_teleop/README.md)) | 新增 |
 | `a2w_description` | A2W URDF/网格与显示 launch(轮式 X2-0807);要看**实机关节角**,用 `a2w_bridge` 的 `a2w_joint_display.launch.py` | 新增 |
 | `point_lio_ros2` | 上游 Point-LIO(新增 `config/a2w.yaml` + `launch/mapping_a2w.launch.py` 适配 A2W 前雷达;为在本机 ROS Lyrical 能编译,CMakeLists 加了 `LOCAL PATCH P10`) | 原有 + 适配 |
 
@@ -55,6 +55,9 @@ ros2 launch a2w_bridge a2w_lio.launch.py show_rviz:=false pcd_save:=true
 
 - Point-LIO 侧新增:`point_lio_ros2/config/a2w.yaml`、`point_lio_ros2/launch/mapping_a2w.launch.py`
 - 桥侧新增:`a2w_bridge/config/a2w_bridge_lio.json`(用 `extends` 继承主配置)、`a2w_bridge/launch/a2w_lio.launch.py`
+- 启动器还带 `a2w_odom_tf`(默认 `odom_tf:=true`):把 LIO 位姿接进机器人 TF 树
+  (`camera_init → base_footprint`),否则 LIO 与机器人是**两棵互不相连的树**。
+  **本栈的 odom 系就是 `camera_init`**(不要再另发叫 `odom` 的帧),Nav2 配 `odom_frame_id: camera_init`
 - 实测(静止 30 s):`/cloud_registered` 10 Hz、位置漂移 2.3 mm、CPU 23%;时序补偿用桥状态行里的
   `点云−IMU滞后差` 直接拄(见 [`src/a2w_bridge/README.md`](src/a2w_bridge/README.md) 的「喂给 Point-LIO」一节)
 

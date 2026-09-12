@@ -1,0 +1,13 @@
+# A2W 2D 占据栅格（由 a2w_pcd_to_map 从 Point-LIO 的 PCD 投影而来）
+#
+# 生成参数：高度带（离地）[0.30, 1.00] m，min-hits=2，
+#           自动化地平面 z = -0.788（建图时 LIO 世界系，≈ 雷达离地高度的相反数）
+# 坐标系：由 map_server 的 frame_id 决定（默认 map）；origin 是栅格左下角的 (x, y, yaw)，
+#         原点即【建图起点】——所以 AMCL 的 initial_pose 用 (0,0,0) 就是"放回建图起点"。
+image: a2w_map.pgm
+resolution: 0.05
+origin: [-8.897, -3.550, 0.000]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+mode: trinary
