@@ -31,6 +31,14 @@ ros2 topic echo /cmd_vel
 
 > 安全：必须按住 LB 才有速度输出；松手后 teleop_twist_joy 自带超时（默认 0.5 s）归零。
 
+## 谁消费 /cmd_vel
+
+默认情况下 `/cmd_vel` **没有消费者**——手柄只能发、机器人不动。要让它真的驱动 A2W，
+打开 `a2w_bridge` 的运动通道（`config/a2w_bridge.json` 里 `motion.enabled=true`），
+由它把 Twist 转成 `sport_client.Move(vx, vy, vyaw)`；建议先用 `motion.dry_run=true`
+验证链路（机器人不会动）。限幅/死区/看门狗/阻尼状态门都在桥侧，详见
+[`a2w_bridge/README.md`](../a2w_bridge/README.md) 的「运动通道」一节。
+
 ## 常用参数
 
 ```bash

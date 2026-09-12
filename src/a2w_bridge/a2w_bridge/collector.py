@@ -49,6 +49,7 @@ from a2w_bridge.dds_topics import (
     TOPIC_SLAM_KEY_INFO,
     sport_state_name,
 )
+from a2w_bridge.motion import MotionController
 
 # PointCloud2 PointField.datatype -> (numpy 字符, 字节数)
 _FIELD_DTYPE = {
@@ -292,6 +293,16 @@ class Collector:
         self.sport_dds_topic = str(sport.get("dds_topic", "rt/sportmodestate"))
         self.sport_rate_hz = sport["rate_hz"]  # config.py 已规范化成 float
 
+        motion = cfg["motion"]
+        self.motion_enabled = bool(motion.get("enabled", False))
+        # 运动通道（下行）：唯一会向机器人发控制指令的地方，配置默认关。
+        # 状态门读的就是 _on_sport 维护的 _last_sport（error_code=1001 阻尼时拒发）。
+        self.motion = (
+            MotionController(motion, log, state_provider=self._sport_snapshot)
+            if self.motion_enabled
+            else None
+        )
+
         sensors = cfg["sensors"]
         self.want = {
             "slam_info": bool(sensors["slam_info"].get("enabled", True)),
@@ -337,6 +348,7 @@ class Collector:
         self._cloud_channels: dict[str, Any] = {}
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
+        self._cmd_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------- 生命周期
     def run(self) -> int:
@@ -357,6 +369,13 @@ class Collector:
         for t in threads:
             t.start()
 
+        if self.motion is not None:
+            try:
+                self.motion.start()
+            except Exception as exc:  # noqa: BLE001 —— 建 RPC 客户端失败不该拖掉整条只读链路
+                log(f"运动通道启动失败（后续不再下发控制指令）: {exc}")
+                self.motion = None
+
         log(
             f"已启动: iface={self.iface} 点云={self._cloud_desc()} IMU={self.imu_source if self.imu_enabled else '关闭'} "
             f"→ tcp://127.0.0.1:{self.port}"
@@ -375,6 +394,11 @@ class Collector:
     def close(self) -> None:
         self._stop.set()
         self._q_event.set()
+        # 先停运动（StopMove 要走 DDS，不能等 socket 关了又关完 DDS 才做）
+        if self.motion is not None:
+            with contextlib.suppress(Exception):
+                self.motion.close()
+            self.motion = None
         if self._sock is not None:
             with contextlib.suppress(Exception):
                 self._sock.close()
@@ -679,6 +703,17 @@ class Collector:
         battery["k"] = "bms"
         self._enqueue_small(battery)
 
+    def _sport_snapshot(self) -> tuple[int, float] | None:
+        """给运动通道状态门用的运控快照：``(error_code, 采样时刻)``；从未收到则 None。"""
+        with self._lock:
+            ls = self._last_sport
+            if not ls:
+                return None
+        try:
+            return int(ls["error_code"]), float(ls["ts"])
+        except (KeyError, TypeError, ValueError):  # noqa: BLE001 —— 快照不完整就按无状态处理
+            return None
+
     def _on_sport(self, msg: Any) -> None:
         """``rt/sportmodestate`` → 运控状态帧（**只读**：仅订阅，绝不发控制指令）。
 
@@ -933,6 +968,7 @@ class Collector:
             else:
                 frame["sport"] = None
             frame["battery"] = lb
+            frame["motion"] = self.motion.status() if self.motion is not None else None
 
             self._enqueue_small(frame)
 
@@ -966,11 +1002,59 @@ class Collector:
                 self._cloud_out_prev = dict(cur)
                 if parts:
                     cloud_out = " 云输出Hz[" + " ".join(parts) + "]"
+            mot = frame.get("motion")
+            if isinstance(mot, dict):
+                if mot.get("blocked"):
+                    mline = f"⚠️motion 被拦({mot['blocked']})"
+                elif mot.get("moving"):
+                    t = mot.get("target") or [0, 0, 0]
+                    mline = (
+                        f"motion {'试运行' if mot.get('dry_run') else '下发'} "
+                        f"vx={t[0]:.2f} vy={t[1]:.2f} vyaw={t[2]:.2f} "
+                        f"(帧龄 {mot.get('age_sec')}s, 共 {mot.get('sent')} 次, 失败 {mot.get('errors')})"
+                    )
+                else:
+                    mline = f"motion 待命(共 {mot.get('sent')} 次, 失败 {mot.get('errors')})"
+            else:
+                mline = "motion 关"
             log(
                 f"状态: 运控={sp} mode_machine={frame.get('mode_machine')} 关节={jd} 电池={bat} | "
+                f"{mline} | "
                 f"点云源={self._active_cloud if self.cloud_enabled else 'off'} "
                 f"IMU源={self._active_imu if self.imu_enabled else 'off'}{timing}{cloud_out} | {rates}"
             )
+
+    # ------------------------------------------------------------ 控制指令（下行）
+    def _cmd_loop(self) -> None:
+        """读 ROS2 节点发来的 ``cmd`` 帧（唯一的下行数据）：move = 速度目标，stop = 立刻刹车。
+
+        这个线程只把目标写给 MotionController（不阻塞、不做 RPC），真正的下发由运动线程
+        按 ``motion.rate_hz`` 做——这样 RPC 抖动/超时不会把帧读取堵住（堵住就等于
+        看门狗失效，会很危险）。
+        """
+        assert self._sock is not None
+        reader = protocol.FrameReader(self._sock)
+        dropped_warn_ts = 0.0
+        while not self._stop.is_set():
+            try:
+                header, _payload = reader.read_frame()
+            except (ConnectionError, OSError):
+                return  # 连接断了：_serve 会退出，close() 里统一 StopMove
+            if str(header.get("t", "")) != "cmd":
+                continue
+            if self.motion is None:  # 通道启动失败：丢弃但限流告警
+                now = time.time()
+                if now - dropped_warn_ts >= 5.0:
+                    dropped_warn_ts = now
+                    log("收到控制指令，但运动通道未启动（启动时失败）→ 已丢弃")
+                continue
+            kind = str(header.get("k", ""))
+            if kind == "move":
+                self.motion.submit(
+                    header.get("vx", 0.0), header.get("vy", 0.0), header.get("vyaw", 0.0)
+                )
+            elif kind == "stop":
+                self.motion.request_stop(str(header.get("reason", "上游要求停止")))
 
     def _connect(self) -> None:
         deadline = time.time() + self.cfg["collector"]["connect_timeout_sec"]
@@ -993,6 +1077,11 @@ class Collector:
     def _serve(self) -> None:
         self._connect()
         assert self._sock is not None
+        # 同一条 TCP 连接上的反方向：采集器只写不读，控制指令（cmd 帧）另起线程读。
+        # 即使运动通道启动失败（motion=None）也要读——不读就会让指令在 socket 缓冲里积压。
+        if self.motion_enabled:
+            self._cmd_thread = threading.Thread(target=self._cmd_loop, name="cmd_in", daemon=True)
+            self._cmd_thread.start()
         while not self._stop.is_set():
             frame = None
             with self._q_lock:

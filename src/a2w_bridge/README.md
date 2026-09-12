@@ -14,8 +14,12 @@
 | 全局占据栅格 | `rt/unitree/slam_relocation/global_map` | `a2w/map/grid`（默认关） | `nav_msgs/OccupancyGrid` |
 | 机器人状态 | —（桥把 lowstate/bms 汇总） | `a2w/status` | `std_msgs/String`（JSON，默认 5 s） |
 | 静态 TF | — | `/tf_static` | 结构外参：base_link → 前雷达/后雷达/IMU（见下节） |
+| **运动通道（下行，默认关）** | `sport_client.Move`（RPC，API 1008） | 订阅 **`/cmd_vel`** | `geometry_msgs/Twist` → `Move(vx,vy,vyaw)`，见「运动通道」一节 |
 
 所有话题时间戳用**采集端墙钟**统一打点；机器人自带时间戳只进日志不做时钟源。
+
+> 除「运动通道」外，本包全部是**只读订阅**；运动通道默认关闭（`motion.enabled=false`），
+> 且带状态门/看门狗/限幅/退出即停四道保护。
 
 ## 结构外参与坐标系（TF）
 
@@ -114,7 +118,7 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1 || echo '已消失 = 确实只�
 五个 ROS2 进程（桥/LIO/RViz 生态）只在 `lo` 上加入该组播；机器人网卡上那两条来自采集器，
 杀掉采集器就立刻消失。
 
-> **为什么可以彻底隔离**：机器人数据不走 ROS2 DDS——采集器(CycloneDDS，只读订阅) → TCP →
+> **为什么可以彻底隔离**：机器人数据不走 ROS2 DDS——采集器(CycloneDDS 订阅 + 可选的 sport RPC) → TCP →
 > ROS2 节点，ROS2 侧纯属本机消费，根本不需要碰机器人网络。
 > 也正因如此，`ROS_LOCALHOST_ONLY=1` 在本机 FastDDS 3.6 **实测不生效**（仍会绑机器人网卡），
 > 要用本包 `config/fastdds_iso.xml` 这份 profile 才行。
@@ -374,6 +378,12 @@ Nav2 参数片段已备好：`config/a2w_nav2_footprint.yaml`
   "tick": 287393,             // lowstate 帧号
   "joints": { "count": 16, "fresh_sec": 0.03 },   // 距上一帧 lowstate（-1=从未收到）
   "sport": { "error_code": 1001, "name": "阻尼(软急停)", "fresh_sec": 0.01 },
+  "motion": {                                      // 运动通道（默认 null=关）
+    "enabled": true, "dry_run": false, "moving": true,
+    "target": [0.4, 0.0, 0.3], "age_sec": 0.05,     // 当前目标与“帧龄”
+    "blocked": null,                                 // 非空 = 被状态门拦截的原因
+    "sent": 128, "errors": 0, "last_code": 0        // 下发次数 / 非0返回码次数 / 最近返回码
+  },
   "battery": null                                   // 默认关，开的话是 {voltage, current, soc, soh}
 }
 ```
@@ -386,6 +396,73 @@ Nav2 参数片段已备好：`config/a2w_nav2_footprint.yaml`
 桥自身健康（当前点云源/IMU 源、各话题实测频率、队列深度）不再上话题，
 只打印在 ROS 日志里（采集器 stderr → 节点日志）。
 
+## 运动通道（`/cmd_vel` → `sport_client.Move`，**默认关**）
+
+这是**全桥唯一会向机器人下发控制指令的通道**，其余部分全是只读订阅。
+默认 `motion.enabled=false`，打开后：
+
+```
+/cmd_vel (geometry_msgs/Twist)                node.py                    collector.py
+  linear.x  → vx（前进）        限幅/死区 → 限频 ──cmd帧──▶ 状态门 → sport_client.Move(vx,vy,vyaw)
+  linear.y  → vy（左移）        看门狗超时 → stop 帧 ──▶ StopMove()
+  angular.z → vyaw（逆时针）
+```
+
+对应官方《A2W 轮足运动服务接口》的 `sport_client`（API 1008 `Move` / 1003 `StopMove`），
+接口与状态机表见 `dds_topics.py:SPORT_STATE_NAMES` 与官方文档。
+
+### 五条安全线（都在 `a2w_bridge/motion.py`）
+
+1. **状态门**：`rt/sportmodestate` 不新鲜、或 `error_code` 落在 `motion.block_codes`
+   （默认 `[1001]` 阻尼/软急停）→ **拒绝下发**并 `StopMove()`。遥控器按 L2+B 软急停时，
+   自主速度指令会被这一层立刻掐掉；
+2. **看门狗**：`stale_sec`（默认 0.5 s）内没有新 `cmd_vel`（手柄断连 / 上游崩溃 /
+   话题没人发）→ `StopMove()`；
+3. **限幅 + 死区**：默认走路·低速档 `vx≤0.8 / vy≤0.5 / vyaw≤2.0`，小抖动归零；
+   两端（node 与 collector）各做一次；
+4. **退出即停**：桥关闭 / 采集器被 terminate → `StopMove()`；
+5. **试运行**：`dry_run=true` 时**不创建** SportClient（不产生任何 RPC），只在日志里打印
+   “本应下发什么”——实机上验证整条链路（手柄 → 话题 → 帧 → 采集器）而不让机器人动一下。
+
+### 打开与验证
+
+```bash
+# 1) 先用试运行验证链路（机器人不会动）
+#    改 config/a2w_bridge.json: "motion": {"enabled": true, "dry_run": true}
+ros2 launch a2w_bridge a2w_bridge.launch.py
+source src/a2w_bridge/scripts/a2w_env.sh && ros2 topic pub -r 10 /cmd_vel \
+    geometry_msgs/Twist "{linear: {x: 0.3}, angular: {z: 0.2}}"
+#    日志应出现: [collector] 运动通道[试运行]: 本应 Move(vx=0.300, ...)
+#    停发 0.5 s 后: 运动通道: 停止（cmd_vel 超时 ...）
+
+# 2) 不连机器人/不连 ROS2 的四条安全线自检（假 SportClient）
+python3 src/a2w_bridge/scripts/motion_selftest.py
+
+# 3) 确认可以真下发：只查 API 版本，不调任何运动接口
+PYTHONPATH=<sdk> .venv-collector/bin/python - <<'PY'
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.a2.sport.sport_client import SportClient
+ChannelFactoryInitialize(0, "enx00e04c2c4260")
+c = SportClient(); c.SetTimeout(1.5); c.Init()
+print(c.GetServerApiVersion())   # (0, '1.0.0.1') = sport 服务在线
+PY
+
+# 4) 真要动: dry_run=false，人站急停旁边，先用 a2w_teleop 的手柄小速度试
+```
+
+⚠️ 打开前确认机器人已切到可移动状态（**非阻尼、非调试模式**——官方文档：进入调试模式后
+内置运控退出，高层运动服务失效），场地清空，手柄软急停在手边。
+
+本机实测（2026-09-13，A2W 实机）：
+
+* **`dry_run=true`**：`/cmd_vel` 的 `linear.x=5.0` 被夹到 `0.80`、`angular.z=-0.01` 被死区归零、
+  按 10 Hz 下发、停发 0.62 s 后触发 `StopMove`；把 `block_codes` 设成机器人当前状态（0）后，
+  一条指令都不再下发（状态门生效）；节点 SIGINT 后采集器日志出现「运动通道: 停止（桥关闭）」；
+* **`dry_run=false`**：实机下发 `Move()` 成功，机器人按 `/cmd_vel` 运动。
+
+`sport` 服务探活（只查 API 版本、不调任何运动接口）返回 `code=0 / version=1.0.0.1`，
+与本机 SDK 客户端版本一致 —— 调用前可用它确认机器人侧服务在线。
+
 ## 架构
 
 ```
@@ -397,12 +474,14 @@ Nav2 参数片段已备好：`config/a2w_nav2_footprint.yaml`
 │ 采集器 collector.py（Python 3.10 + cyclonedds 0.10.2 + unitree_sdk2py）│
 │   · 网卡/来源/传感器开关全部来自 JSON 配置                          │
 │   · 点云 BEST_EFFORT + KEEP_LAST(1)，同一时刻只订阅一个点云话题      │
+│   · 运动通道（唯一的下行，默认关）：cmd 帧 → sport_client.Move()    │
 └──────────────┬────────────────────────────────────────────────────┘
-               │ 本机 TCP 帧（127.0.0.1:42610，JSON 头 + 二进制点云）
+               │ 本机 TCP 帧（127.0.0.1:42610，JSON 头 + 二进制点云；cmd 帧反向走同一条连接）
 ┌──────────────▼────────────────────────────────────────────────────┐
 │ a2w_bridge_node（rclpy，ROS2 的 Python —— 本机为 3.14）              │
 │   · 采集器崩溃自动重启（退避 1/2/5/10 s）                           │
 │   · 发布上表全部标准消息 + 静态 TF                                  │
+│   · 运动通道：/cmd_vel → 限幅/死区 → 限频/看门狗 → cmd 帧           │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -473,6 +552,15 @@ ip maddr show lo | grep 239.255.0.1         # ROS2 只在回环组播（机器�
 | `battery.enabled` / `topic` / `dds_topic` | `false`（默认关！） / `a2w/battery` / `rt/bms_state` | 电池（mV/mA 自动换成 V/A）。**默认关**：本机实测订阅 `rt/bms_state` 会让 CycloneDDS 0.10.2 约 25s 后段错误（固件侧 XTypes 类型不兼容），代码路径完整保留，待 SDK/固件问题解决后再开 |
 | `ros.isolate` / `domain_id` / `fastdds_profile` | `true` / `42` / `fastdds_iso.xml` | **ROS2 与机器人控制网的隔离**（见上一节）。`domain_id` 不能是 0，否则配置直接报错 |
 | `sport_state.enabled` / `topic` / `dds_topic` / `rate_hz` | `true` / `a2w/sport_state` / `rt/sportmodestate` / `10.0` | 只读运控状态机（1001=阻尼/软急停）；机器人侧 ~300 Hz，输出限频 |
+| `motion.enabled` | **`false`（默认关）** | 运动通道总开关：`/cmd_vel` → `sport_client.Move`。**全桥唯一的下行控制**，见上一节 |
+| `motion.topic` | `cmd_vel` | 订阅的 Twist 话题（`a2w_teleop` 的 Xbox 遥操作默认也发这里） |
+| `motion.rate_hz` / `stale_sec` | `20.0` / `0.5` | Move 下发频率 / 看门狗：这么久没有新 cmd_vel → `StopMove()` |
+| `motion.limits` | `{vx: 0.8, vy: 0.5, vyaw: 2.0}` | 限幅（默认走路·低速档）。想上跑步档先 `SwitchGait`/`SpeedLevel` 再改这里 |
+| `motion.deadband` | `{linear: 0.02, angular: 0.05}` | 死区：小于该值的指令归零（抑制静止抖动） |
+| `motion.require_state` / `state_stale_sec` / `block_codes` | `true` / `1.0` / `[1001]` | 状态门：运控状态不新鲜或命中 `block_codes`（1001=阻尼/软急停）→ 拒绝下发 |
+| `motion.timeout_sec` | `0.3` | SportClient RPC 超时（SDK 默认 1 s 会把控制循环拖垮） |
+| `motion.preflight` | `[]` | 首次下发前调一次的方法名，如 `["BalanceStand"]`（解除锁定）。只放开无参安全动作 |
+| `motion.stop_on_exit` / `dry_run` | `true` / `false` | 退出时 StopMove / 试运行（不建 SportClient，只打日志） |
 | `display.enabled` / `input_topic` / `output_topic` | `true` / `a2w/joint_states` / `joint_states` | RViz 显示用的关节转发（SDK 名 → URDF 名），见「在 RViz 里看真实关节」 |
 | `display.rate_hz` / `stale_sec` | `50.0` / `2.0` | `/joint_states` 限频与断流保护（秒） |
 | `display.flip` | `[]` | 需要反号的 SDK 关节名列表（RViz 里腿方向反了才加） |

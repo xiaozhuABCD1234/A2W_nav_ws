@@ -11,6 +11,7 @@
     collector        : 采集器进程（Python 3.10 venv / SDK 路径 / 端口 / 重启退避）
     pointcloud       : 点云（single 单源 + 自动轮换 / multi 多源同时收）
     imu              : IMU（lidar_front / lidar_rear / lowstate / auto / all）
+    motion           : **唯一的下行控制通道**（/cmd_vel → sport_client.Move，默认关）
     sensors          : slam_info、slam_key_info、全局占据栅格
     tf               : 静态 TF（base → lidar / imu 等）
 """
@@ -151,6 +152,36 @@ DEFAULTS: dict[str, Any] = {
         "topic": "a2w/sport_state",
         "dds_topic": TOPIC_SPORT_STATE,
         "rate_hz": 10.0,          # 输出限频（机器人侧 ~300 Hz）
+    },
+    "motion": {
+        # ⚠️ **全桥唯一会向机器人下发控制指令的通道**，默认关闭。
+        #
+        # /cmd_vel（geometry_msgs/Twist）→ 限幅/死区 → 限频 → 采集器调用
+        # sport_client.Move(vx, vy, vyaw)（官方《A2W 轮足运动服务接口》API 1008）。
+        #
+        # 打开前请确认：机器人已切到可移动状态（非阻尼/调试模式）、场地清空、
+        # 手柄软急停（L2+B）在手边 —— 1001 阻尼时本通道会自动拒绝下发并 StopMove。
+        # 想只验证链路不让机器人动，用 "dry_run": true（不建 SportClient，只打日志）。
+        "enabled": False,
+        "topic": "cmd_vel",       # 订阅话题（Xbox 遥操作 a2w_teleop 默认也发这里）
+        "rate_hz": 20.0,           # Move 下发频率（RPC 是 request-response，别开太高）
+        "stale_sec": 0.5,          # cmd_vel 超时 → 自动 StopMove（手柄断连/上游崩溃）
+        "limits": {                # 限幅：默认走路·低速档 [±0.8, ±0.5, ±2.0]
+            "vx": 0.8,             #   想上跑步档先改 SwitchGait/SpeedLevel 再改这里
+            "vy": 0.5,
+            "vyaw": 2.0,
+        },
+        "deadband": {              # 死区：小于该值的指令归零（抑制静止抖动）
+            "linear": 0.02,        #   m/s
+            "angular": 0.05,       #   rad/s
+        },
+        "require_state": True,     # 状态门：rt/sportmodestate 不新鲜就拒绝下发
+        "state_stale_sec": 1.0,    #   状态门的新鲜度阈值
+        "block_codes": [1001],     # 拒绝下发的运控状态（1001=阻尼/软急停）
+        "timeout_sec": 0.3,        # SportClient RPC 超时（默认 1s 会把控制循环拖垮）
+        "preflight": [],           # 首次下发前调一次的方法名，例如 ["BalanceStand"]
+        "stop_on_exit": True,      # 桥退出/采集器被 terminate 时 StopMove
+        "dry_run": False,          # true = 只打日志，不建 SportClient（实机验证链路用）
     },
     "display": {
         # 在 RViz 里用 a2w_description 的 URDF 显示**真实关节角**（纯只读，见
@@ -330,6 +361,35 @@ def _normalize(cfg: dict[str, Any]) -> None:
     sport["enabled"] = bool(sport.get("enabled", True))
     sport["rate_hz"] = _num(float, "sport_state.rate_hz", sport.get("rate_hz", 10.0) or 10.0)
 
+    motion = cfg["motion"]
+    motion["enabled"] = bool(motion.get("enabled", False))
+    motion["topic"] = str(motion.get("topic", "cmd_vel") or "cmd_vel")
+    motion["rate_hz"] = _num(float, "motion.rate_hz", motion.get("rate_hz", 20.0) or 20.0)
+    motion["stale_sec"] = _num(float, "motion.stale_sec", motion.get("stale_sec", 0.5) or 0.5)
+    motion["state_stale_sec"] = _num(
+        float, "motion.state_stale_sec", motion.get("state_stale_sec", 1.0) or 1.0
+    )
+    motion["timeout_sec"] = _num(float, "motion.timeout_sec", motion.get("timeout_sec", 0.3) or 0.3)
+    motion["require_state"] = bool(motion.get("require_state", True))
+    motion["stop_on_exit"] = bool(motion.get("stop_on_exit", True))
+    motion["dry_run"] = bool(motion.get("dry_run", False))
+    motion["preflight"] = [str(name) for name in _as_list(motion.get("preflight"))]
+    block = _num_list("motion.block_codes", _as_list(motion.get("block_codes")))
+    try:
+        motion["block_codes"] = [int(code) for code in (block or [1001.0])]
+    except (TypeError, ValueError):  # noqa: BLE001 —— _num_list 已把关，此处仅防御
+        motion["block_codes"] = [1001]
+    for group, keys, fallback in (
+        ("limits", ("vx", "vy", "vyaw"), (0.8, 0.5, 2.0)),
+        ("deadband", ("linear", "angular"), (0.02, 0.05)),
+    ):
+        raw_group = motion.get(group)
+        raw_group = raw_group if isinstance(raw_group, dict) else {}
+        motion[group] = {
+            key: _num(float, f"motion.{group}.{key}", raw_group.get(key, default) or 0.0)
+            for key, default in zip(keys, fallback)
+        }
+
     disp = cfg["display"]
     disp["enabled"] = bool(disp.get("enabled", True))
     disp["input_topic"] = str(disp.get("input_topic", "a2w/joint_states") or "a2w/joint_states")
@@ -426,6 +486,33 @@ def validate(cfg: dict[str, Any]) -> None:
         )
     if cfg["sport_state"]["enabled"] and cfg["sport_state"]["rate_hz"] <= 0:
         raise ConfigError("sport_state.rate_hz 必须 > 0")
+
+    motion = cfg["motion"]
+    if motion["enabled"]:
+        if not motion["topic"]:
+            raise ConfigError("motion.topic 不能为空（要订阅 /cmd_vel 之类的 Twist 话题）")
+        if motion["rate_hz"] <= 0:
+            raise ConfigError("motion.rate_hz 必须 > 0")
+        if motion["stale_sec"] <= 0:
+            raise ConfigError("motion.stale_sec 必须 > 0（否则 cmd_vel 一停就永远不再 StopMove）")
+        if motion["require_state"] and motion["state_stale_sec"] <= 0:
+            raise ConfigError("motion.state_stale_sec 必须 > 0（状态门要判新鲜度）")
+        if motion["timeout_sec"] <= 0:
+            raise ConfigError("motion.timeout_sec 必须 > 0")
+        if motion["limits"] == {"vx": 0.0, "vy": 0.0, "vyaw": 0.0}:
+            raise ConfigError("motion.limits 全为 0，机器人不会动；至少给一个方向的速度上限")
+        if not cfg["sport_state"].get("enabled", True) and motion["require_state"]:
+            raise ConfigError(
+                "motion.require_state=true 需要 sport_state.enabled=true"
+                "（状态门要读 rt/sportmodestate 的 error_code；确定不要状态门就设 require_state=false）"
+            )
+        known = {"Damp", "BalanceStand", "StandUp", "RecoveryStand", "SpeedLevel", "SwitchGait"}
+        bad_pre = [name for name in motion["preflight"] if name not in known]
+        if bad_pre:
+            raise ConfigError(
+                f"motion.preflight 含未支持的预动作 {bad_pre}；可用: {sorted(known)}"
+                "（只放开无参数的安全动作，避免误触发空翻/侧步之类）"
+            )
 
     disp = cfg["display"]
     if disp["rate_hz"] <= 0:
@@ -532,11 +619,21 @@ def describe(cfg: dict[str, Any]) -> str:
     battery = "电池" if cfg["battery"].get("enabled") else "电池(关)"
     disp = cfg.get("display", {})
     display = f"显示={disp.get('rate_hz', 50.0):g}Hz" if disp.get("enabled") else "显示(关)"
+    mot = cfg.get("motion", {})
+    if mot.get("enabled"):
+        limits = mot.get("limits", {})
+        motion = (
+            f"运动={mot.get('topic', 'cmd_vel')}→Move@{mot.get('rate_hz', 20.0):g}Hz"
+            f"(vx≤{limits.get('vx', 0)},vy≤{limits.get('vy', 0)},vyaw≤{limits.get('vyaw', 0)})"
+            + ("[试运行]" if mot.get("dry_run") else "")
+        )
+    else:
+        motion = "运动(关)"
     ros = cfg["ros"]
     iso = f"ROS域={ros['domain_id']}(隔离)" if ros.get("isolate") else "ROS域未隔离"
     return (
         f"iface={cfg['iface']} 点云={cloud} IMU={imu['source'] if imu['enabled'] else '关闭'} "
-        f"{joint_desc} {battery} {display} {iso} 配置文件={cfg.get('_config_path')}"
+        f"{joint_desc} {battery} {display} {motion} {iso} 配置文件={cfg.get('_config_path')}"
     )
 
 

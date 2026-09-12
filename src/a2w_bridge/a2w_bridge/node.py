@@ -43,7 +43,7 @@ from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory
 
 from builtin_interfaces.msg import Time as RosTime
-from geometry_msgs.msg import Point, Pose, Quaternion, TransformStamped, Vector3
+from geometry_msgs.msg import Point, Pose, Quaternion, TransformStamped, Twist, Vector3
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState, Imu, JointState, PointCloud2, PointField
 from std_msgs.msg import String
@@ -52,6 +52,7 @@ from tf2_ros import StaticTransformBroadcaster
 from . import protocol
 from .config import ConfigError, describe, find_ws_root, load_config, resolve_python, resolve_sdk_path
 from .dds_topics import CLOUD_TOPICS, IMU_TOPICS
+from .motion import shape_cmd
 
 HEADER_FIELDS = ("x", "y", "z", "intensity")
 
@@ -163,6 +164,17 @@ class A2WBridgeNode(Node):
         self._server_thread: threading.Thread | None = None
         self._proc_lock = threading.Lock()
         self._restart_idx = 0
+
+        # 运动通道（下行）：/cmd_vel → 限幅/死区 → 限频 → cmd 帧 → 采集器 Move()。
+        # 这里只做“目标值搬运 + 看门狗”，真正的状态门/限幅在采集器（它能读运控状态）。
+        self.motion_cfg = self.cfg["motion"]
+        self.motion_enabled = bool(self.motion_cfg.get("enabled", False))
+        self._cmd_lock = threading.Lock()
+        self._cmd_target: tuple[float, float, float] | None = None  # 最新速度目标
+        self._cmd_ts = 0.0                                          # 目标到达墙钟
+        self._cmd_warn_ts = 0.0                                     # “采集器未连”日志限流
+        self._conn: socket.socket | None = None
+        self._conn_lock = threading.Lock()
 
         self._make_publishers()
         self._broadcast_static_tf()
@@ -320,6 +332,8 @@ class A2WBridgeNode(Node):
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.get_logger().info("采集器已连接")
             self._restart_idx = 0  # 联通了，重启计数清零
+            with self._conn_lock:
+                self._conn = conn
             try:
                 self._pump(conn)
             except ConnectionError:
@@ -327,6 +341,9 @@ class A2WBridgeNode(Node):
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"帧处理异常: {exc}")
             finally:
+                with self._conn_lock:
+                    if self._conn is conn:
+                        self._conn = None
                 with contextlib.suppress(OSError):
                     conn.close()
 
@@ -551,13 +568,104 @@ class A2WBridgeNode(Node):
         bline = f"{battery.get('voltage')}V/{battery.get('soc')}%" if isinstance(battery, dict) else "无数据"
         sport = header.get("sport")
         sline = sport.get("name") if isinstance(sport, dict) else "无数据"
+        mot = header.get("motion")
+        if isinstance(mot, dict):
+            if mot.get("blocked"):
+                mline = f"motion=被拦({mot['blocked']})"
+            elif mot.get("moving"):
+                t = mot.get("target") or [0.0, 0.0, 0.0]
+                mline = (
+                    f"motion={'试运行' if mot.get('dry_run') else '下发'} "
+                    f"[{_f(t[0]):.2f},{_f(t[1]):.2f},{_f(t[2]):.2f}] 帧龄{_f(mot.get('age_sec')):.1f}s"
+                )
+            else:
+                mline = f"motion=待命(失败{_i(mot.get('errors'))})"
+        elif mot is None:
+            mline = "motion=关"
+        else:
+            mline = "motion=?"
         self.get_logger().info(
             f"机器人状态: 运控={sline} mode_machine={header.get('mode_machine')} mode_pr={header.get('mode_pr')} "
-            f"| 关节: {jline} | 电池: {bline}"
+            f"| 关节: {jline} | 电池: {bline} | {mline}"
         )
+
+    def _on_cmd_vel(self, msg: Any) -> None:
+        """``/cmd_vel``（geometry_msgs/Twist）→ 最新速度目标。
+
+        Twist 到 A2W 的映射：``linear.x``→vx（前进）、``linear.y``→vy（左移）、
+        ``angular.z``→vyaw（逆时针）。限幅/死区在两端各做一次（这里是第一道）。
+        """
+        vx, vy, vyaw = shape_cmd(
+            _f(msg.linear.x), _f(msg.linear.y), _f(msg.angular.z),
+            self.motion_cfg.get("limits"), self.motion_cfg.get("deadband"),
+        )
+        with self._cmd_lock:
+            self._cmd_target = (vx, vy, vyaw)
+            self._cmd_ts = time.time()
+
+    def _send_cmd(self, header: dict[str, Any]) -> bool:
+        """向采集器发一帧控制指令；未连接/写失败返回 False（不抛）。"""
+        with self._conn_lock:
+            conn = self._conn
+            if conn is None:
+                now = time.time()
+                if now - self._cmd_warn_ts >= 5.0:
+                    self._cmd_warn_ts = now
+                    self.get_logger().warning("运动指令: 采集器未连接，指令被丢弃")
+                return False
+            try:
+                conn.sendall(protocol.pack(header))
+                return True
+            except OSError as exc:
+                now = time.time()
+                if now - self._cmd_warn_ts >= 5.0:
+                    self._cmd_warn_ts = now
+                    self.get_logger().warning(f"运动指令: 下发失败（{exc}）")
+                return False
+
+    def _motion_loop(self) -> None:
+        """按 ``motion.rate_hz`` 把最新目标发给采集器；看门狗超时就发 stop 帧。
+
+        只发目标不调 RPC：RPC 在采集器侧（Python 3.10 + SDK）执行，这里卡住也不影响
+        传感器链路。
+        """
+        period = 1.0 / max(_f(self.motion_cfg.get("rate_hz"), 20.0), 1e-3)
+        stale = max(_f(self.motion_cfg.get("stale_sec"), 0.5), 1e-3)
+        stopped = True
+        while not self._stop.wait(period):
+            now = time.time()
+            with self._cmd_lock:
+                target, ts = self._cmd_target, self._cmd_ts
+            if target is None or ts <= 0 or (now - ts) > stale:
+                if not stopped:
+                    reason = "cmd_vel 超时 %.2fs" % (now - ts) if target is not None else "无 cmd_vel"
+                    self._send_cmd({"t": "cmd", "k": "stop", "reason": reason})
+                    self.get_logger().info(f"运动指令: {reason} → StopMove")
+                    stopped = True
+                continue
+            vx, vy, vyaw = target
+            if self._send_cmd({"t": "cmd", "k": "move", "vx": vx, "vy": vy, "vyaw": vyaw}):
+                if stopped:
+                    self.get_logger().info(
+                        f"运动指令: 开始下发 vx={vx:.2f} vy={vy:.2f} vyaw={vyaw:.2f}"
+                    )
+                    stopped = False
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
+        if self.motion_enabled:
+            cfg = self.motion_cfg
+            self.create_subscription(Twist, str(cfg["topic"]), self._on_cmd_vel, 10)
+            limits = cfg.get("limits", {})
+            tail = "（试运行：采集器只打日志，不向机器人下发）" if cfg.get("dry_run") else ""
+            self.get_logger().info(
+                f"运动通道已开: {cfg['topic']} → Move@{_f(cfg.get('rate_hz'), 20.0):g}Hz "
+                f"限幅 vx≤{_f(limits.get('vx')):g} vy≤{_f(limits.get('vy')):g} "
+                f"vyaw≤{_f(limits.get('vyaw')):g}，超时 {_f(cfg.get('stale_sec'), 0.5):g}s→StopMove{tail}"
+            )
+            threading.Thread(target=self._motion_loop, daemon=True, name="motion_cmd").start()
+        else:
+            self.get_logger().info("运动通道关闭（motion.enabled=false，全桥只读）")
         self._server_thread = threading.Thread(target=self._serve, daemon=True, name="tcp_server")
         self._server_thread.start()
         threading.Thread(target=self._supervise, daemon=True, name="supervise").start()
@@ -565,6 +673,9 @@ class A2WBridgeNode(Node):
     def stop(self) -> None:
         self.get_logger().info("正在关闭…")
         self._stop.set()
+        if self.motion_enabled:
+            # 尽力发一帧停止（采集器里的 close() 还会再 StopMove 一次，双保险）
+            self._send_cmd({"t": "cmd", "k": "stop", "reason": "桥关闭"})
         with self._proc_lock:
             if self._proc is not None and self._proc.poll() is None:
                 self._proc.terminate()

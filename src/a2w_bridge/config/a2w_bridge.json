@@ -125,6 +125,30 @@
     "dds_topic": "rt/sportmodestate",
     "rate_hz": 10.0
   },
+  "motion": {
+    "enabled": true,
+    "topic": "cmd_vel",
+    "rate_hz": 20.0,
+    "stale_sec": 0.5,
+    "limits": {
+      "vx": 0.8,
+      "vy": 0.5,
+      "vyaw": 2.0
+    },
+    "deadband": {
+      "linear": 0.02,
+      "angular": 0.05
+    },
+    "require_state": true,
+    "state_stale_sec": 1.0,
+    "block_codes": [
+      1001
+    ],
+    "timeout_sec": 0.3,
+    "preflight": [],
+    "stop_on_exit": true,
+    "dry_run": false
+  },
   "sensors": {
     "slam_info": {
       "enabled": true,

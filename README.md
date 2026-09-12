@@ -4,7 +4,8 @@ ROS2 (Lyrical) 工作空间,当前包含:
 
 | 包 | 内容 | 状态 |
 | --- | --- | --- |
-| `a2w_bridge` | **A2W 机器人 → ROS2 桥接**:点云 / IMU / 关节状态(16 关节含轮足) / 电池 / SLAM 广播 / 栅格,全部标准 ROS2 消息,行为由 JSON 配置(网卡、点云源 fused/front/rear、IMU 源等);**含一条命令把点云喂给 Point-LIO 的 `a2w_lio.launch.py`;**动态 `base_footprint` TF 与 2D 足迹(`a2w_base_footprint`,Nav2 定位/代价地图用) | ✅ 本机实测可用 |
+| `a2w_bridge` | **A2W 机器人 → ROS2 桥接**:点云 / IMU / 关节状态(16 关节含轮足) / 电池 / SLAM 广播 / 栅格,全部标准 ROS2 消息,行为由 JSON 配置(网卡、点云源 fused/front/rear、IMU 源等);**含一条命令把点云喂给 Point-LIO 的 `a2w_lio.launch.py`;**动态 `base_footprint` TF 与 2D 足迹(`a2w_base_footprint`,Nav2 定位/代价地图用);**含唯一的运动通道 `/cmd_vel` → `sport_client.Move`(默认关,带阻尼状态门/看门狗/限幅)** | ✅ 本机实测可用 |
+| `a2w_teleop` | Xbox 手柄 → `/cmd_vel`(ROS 2 自带 `joy` + `teleop_twist_joy`,无自定义节点);打开桥的运动通道后才真正驱动机器人 | 新增 |
 | `a2w_description` | A2W URDF/网格与显示 launch(轮式 X2-0807);要看**实机关节角**,用 `a2w_bridge` 的 `a2w_joint_display.launch.py` | 新增 |
 | `point_lio_ros2` | 上游 Point-LIO(新增 `config/a2w.yaml` + `launch/mapping_a2w.launch.py` 适配 A2W 前雷达;为在本机 ROS Lyrical 能编译,CMakeLists 加了 `LOCAL PATCH P10`) | 原有 + 适配 |
 
