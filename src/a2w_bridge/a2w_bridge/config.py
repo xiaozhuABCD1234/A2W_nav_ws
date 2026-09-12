@@ -76,8 +76,8 @@ DEFAULTS: dict[str, Any] = {
         # multi : 同时订阅 fused/front/rear（会成倍占用链路，需自行确认交换机带宽）
         "mode": "single",
         # single 模式的来源: fused / front / rear / mapping / relocation / auto
-        # auto = 按 failover_order 轮换（当前话题长时间无数据就换下一个）
-        "source": "auto",
+        # 默认 fused（前后雷达融合）；auto = 按 failover_order 轮换（当前话题长时间无数据就换下一个）
+        "source": "fused",
         "failover_order": list(CLOUD_FAILOVER_ORDER),
         "stale_sec": 6.0,
         "topic": "a2w/points",

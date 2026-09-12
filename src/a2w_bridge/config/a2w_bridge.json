@@ -28,7 +28,7 @@
   "pointcloud": {
     "enabled": true,
     "mode": "single",
-    "source": "auto",
+    "source": "front",
     "failover_order": ["fused", "front", "rear"],
     "stale_sec": 6.0,
     "topic": "a2w/points",

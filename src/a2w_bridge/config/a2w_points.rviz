@@ -1,0 +1,124 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+  - Class: rviz_common/Time
+    Name: Time
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 30
+      Color: 90; 90; 90
+      Alpha: 0.4
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false
+      Marker Scale: 0.4
+      Show Names: true
+    # ===== 默认只显示融合点云（a2w/points）=====
+    # single 模式（桥的 pointcloud.mode=single + source=fused）下，全部点云都发在这一个话题上，
+    # 内容就是前后雷达的融合点云。同一条话题改名/改配色：选中本行后在右侧面板改。
+    - Class: rviz_default_plugins/PointCloud2
+      Name: a2w/points (fused)
+      Enabled: true
+      Topic:
+        Value: /a2w/points
+        Depth: 5
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.01
+      Alpha: 1
+      Decay Time: 0.2
+      Position Transformer: XYZ
+      Color Transformer: AxisColor
+      Axis: Z
+      Autocompute Value Bounds: true
+      Min Value: -1
+      Max Value: 3
+      Autocompute Intensity Bounds: true
+      Use Fixed Frame: true
+      Selectable: true
+    # ===== 以下三路只在 pointcloud.mode=multi 时才有数据，默认不显示 =====
+    # 想同时看前后雷达：把 JSON 改成 "mode": "multi" 重启桥，再把下面三段的
+    # 注释去掉（每段从 "- Class:" 到下一个同级条目之前），或直接在 RViz 里点 Add
+    # 加三个 PointCloud2 分别填 /a2w/points_fused、/a2w/points_front、/a2w/points_rear
+    #
+    # - Class: rviz_default_plugins/PointCloud2
+    #   Name: a2w/points_fused (multi)
+    #   Enabled: false
+    #   Topic: {Value: /a2w/points_fused, Depth: 5, History Policy: Keep Last,
+    #           Reliability Policy: Best Effort, Durability Policy: Volatile}
+    #   Style: Points
+    #   Size (Pixels): 2
+    #   Alpha: 1
+    #   Decay Time: 0.2
+    #   Position Transformer: XYZ
+    #   Color Transformer: AxisColor
+    #   Axis: Z
+    #   Use Fixed Frame: true
+    #
+    # - Class: rviz_default_plugins/PointCloud2
+    #   Name: a2w/points_front (multi)
+    #   Enabled: false
+    #   Topic: {Value: /a2w/points_front, Depth: 5, History Policy: Keep Last,
+    #           Reliability Policy: Best Effort, Durability Policy: Volatile}
+    #   Style: Points
+    #   Size (Pixels): 2
+    #   Alpha: 1
+    #   Decay Time: 0.2
+    #   Position Transformer: XYZ
+    #   Color Transformer: FlatColor
+    #   Color: 80; 200; 120
+    #   Use Fixed Frame: true
+    #
+    # - Class: rviz_default_plugins/PointCloud2
+    #   Name: a2w/points_rear (multi)
+    #   Enabled: false
+    #   Topic: {Value: /a2w/points_rear, Depth: 5, History Policy: Keep Last,
+    #           Reliability Policy: Best Effort, Durability Policy: Volatile}
+    #   Style: Points
+    #   Size (Pixels): 2
+    #   Alpha: 1
+    #   Decay Time: 0.2
+    #   Position Transformer: XYZ
+    #   Color Transformer: FlatColor
+    #   Color: 230; 140; 60
+    #   Use Fixed Frame: true
+  Global Options:
+    Fixed Frame: a2w/lidar
+    Frame Rate: 30
+    Background Color: 40; 40; 40
+    Default Light: true
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Target Frame: <Fixed Frame>
+      Distance: 12
+      Focal Point: [0, 0, 0]
+      Yaw: 2.35
+      Pitch: -0.42
+Window Geometry:
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false
+  Height: 1000
+  Width: 1600
+  X: 220
+  Y: 110
+  Hide Left Dock: false
+  Hide Right Dock: false

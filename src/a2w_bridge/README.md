@@ -47,6 +47,31 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1     # 期望：无输出
 > 也正因如此，`ROS_LOCALHOST_ONLY=1` 在本机 FastDDS 3.6 **实测不生效**（仍会绑机器人网卡），
 > 要用本包 `config/fastdds_iso.xml` 这份 profile 才行。
 
+## 看实时点云（RViz：`a2w_points_rviz.launch.py`）
+
+模仿 `livox_ros_driver2/launch_ROS2/rviz_MID360_launch.py` 的写法：一条命令 = 桥 + RViz。
+
+```bash
+source src/a2w_bridge/scripts/a2w_env.sh     # 必须：本终端的 RViz 也要在同一 ROS 域
+ros2 launch a2w_bridge a2w_points_rviz.launch.py
+
+# 桥已经在别的终端跑 → 不要重复起桥
+ros2 launch a2w_bridge a2w_points_rviz.launch.py bridge:=false
+# 只起桥不看图 / 换 RViz 配置
+ros2 launch a2w_bridge a2w_points_rviz.launch.py rviz:=false
+ros2 launch a2w_bridge a2w_points_rviz.launch.py rviz_config:=/path/my.rviz
+```
+
+- RViz 配置：`config/a2w_points.rviz` —— `Fixed Frame = a2w/lidar`（与 JSON 的
+  `pointcloud.frame_id` 必须一致），**默认只显示一项：融合点云**（话题 `/a2w/points`，
+  因为桥默认 `mode=single` + `source=fused`，这一话题里就是前后雷达融合点云）；
+  `multi` 模式的三路（`points_fused|front|rear`）在配置里**注释保留**，需要时打开注释
+  或 RViz 里 Add 三个 PointCloud2
+- 改话题名/坐标系/点大小：直接编辑这份 rviz 配置（RViz 里改完也可另存）
+- 关掉 RViz 窗口 = 整个 launch 退出（参照文件里那段被注释掉的 `OnProcessExit` 写法）
+- ⚠️ 实测提醒：默认输出里约 35% 的点是雷达无回波的 `(0,0,0)`，在 RViz 里会表现为
+  传感器中心一个很密的亮点团；要丢掉需要加 `min_range` 类过滤（本包暂无，见 FAQ）
+
 ## 关节（`a2w/joint_states`）
 
 A2W 是**轮足机器狗**：4 条腿 × (髋/大腿/小腿) + 4 个轮足电机 = **16 个自由度**。
@@ -221,7 +246,7 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生
 | `collector.port` | `42610` | 本机 TCP 端口（冲突时改） |
 | `pointcloud.enabled` | `true/false` | 是否收点云 |
 | `pointcloud.mode` | `single`（默认）/ `multi` | `single`=同一时刻只订阅一个点云话题；`multi`=同时收 fused/front/rear 发到 `multi_topics` |
-| `pointcloud.source` | `fused` / `front` / `rear` / `mapping` / `relocation` / **`auto`**（默认） | `single` 模式的点云源 |
+| `pointcloud.source` | **`fused`**（默认）/ `front` / `rear` / `mapping` / `relocation` / `auto` | `single` 模式的点云源。默认固定**融合**点云、不轮换；`auto` = 按 `failover_order` 轮换（当前源长时间无数据就换下一个） |
 | `pointcloud.failover_order` | `["fused","front","rear"]` | `auto` 时的轮换顺序（无数据超过 `stale_sec` 换下一个） |
 | `pointcloud.stale_sec` | `6.0` | 多少秒收不到数据判定“断了” |
 | `pointcloud.topic` / `frame_id` | `a2w/points` / `a2w/lidar` | `single` 模式输出话题与坐标系 |
@@ -254,8 +279,9 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生
 
 因此：
 
-1. **`single` 模式一次只订阅一个点云话题**（默认）—— `auto` 会在当前源
-   `stale_sec` 无数据时自动轮换（实测融合源时有时无，`front` 通常最稳）；
+1. **`single` 模式一次只订阅一个点云话题**（默认，且默认源固定为 `fused` 融合点云，不轮换）；
+   想要熔断降级就把 `pointcloud.source` 改成 `auto` —— 它在当前源 `stale_sec` 无数据时
+   自动轮换（实测融合源时有时无，`front` 通常最稳）；
 2. 点云 reader 固定 `BEST_EFFORT + KEEP_LAST(1)`：不触发重传、不积压历史帧；
 3. `multi` 模式会同时拉 fused/front/rear 三路（~240 Mbps 起），只在交换机/网卡
    带宽确认有余量时再开。
@@ -297,6 +323,12 @@ foxy/humble，与本机 Lyrical（默认 FastDDS）不兼容，且 A2W 的
 
 ## 常见问题
 
+- **RViz 里点云中心有个密集亮点团** → 雷达无回波的 `(0,0,0)` 无效点（实测占单帧 35%），
+  本包只丢 NaN/inf、不丢零点；要清掉得加 `pointcloud.min_range`（现在没有这个开关），
+  或在上游（`point_lio`/`pcl`）过滤。
+- **`a2w_points_rviz.launch.py` 里 RViz 空的 / 没有点** → ① 确认起 launch 的终端已
+  `source src/a2w_bridge/scripts/a2w_env.sh`；② 确认 `Fixed Frame`（默认 `a2w/lidar`）
+  与 JSON 的 `pointcloud.frame_id` 一致；③ 桥已在别处跑时加 `bridge:=false`。
 - **RViz 里关节不动 / 一直定格同一个姿态** → ① 先确认桥在跑、且**本终端也在隔离域**
   （`source src/a2w_bridge/scripts/a2w_env.sh`）；② `ros2 topic hz /joint_states` 应为 50 Hz；
   ③ 没数据时 `joint_relay` 会打 WARN 并在超过 `display.stale_sec` 后**停发**（设计如此，
