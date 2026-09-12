@@ -68,6 +68,43 @@ A2W_JOINT_NAMES = [
 ]
 A2W_JOINT_INDEXES = list(range(16))  # motor_state 槽位 [0..15]（0~11 腿关节，12~15 轮）
 
+# ---------------------------------------------------------------------------
+# URDF 关节名映射（RViz 显示用，纯只读）
+#
+# 源：src/a2w_description/urdf/a2w_description.urdf（SolidWorks 导出）
+#   {left,right}_{front,hind}_joint1 = 髀（轴 1 0 0）
+#   ..._joint2 = 大腿（轴 0 1 0）  ..._joint3 = 小腿（轴 0 1 0）
+#   ..._joint4 = 轮足（continuous，轴 0 1 0）
+#
+# 腿序：FR→right_front  FL→left_front  RR→right_hind  RL→left_hind
+#      （URDF 前腿在 +x；左腿在 +y，与 ROS/宇树 x 前 y 左 一致）
+#
+# 符号：URDF 限位与官方 SDK 限位同区间同符号——小腿 -2.77~-0.54 rad
+#      （-158.7°~-30.9°）、大腿 -2.34~3.15 rad（-134°~180°），
+#      而实测站立时 SDK 小腿 = -1.56 rad、卧倒 = -2.76 rad，都落在 URDF 的
+#      负区间内；若反号会直接超出 URDF 限位，因此默认不反号。
+#      万一实机对标发现某条腿方向反了，在配置里加 display.flip: ["FR_thigh"]
+#      即可（不改 URDF、不改代码）。
+# ---------------------------------------------------------------------------
+A2W_URDF_JOINT_NAMES: dict[str, str] = {
+    "FR_hip": "right_front_joint1",
+    "FR_thigh": "right_front_joint2",
+    "FR_calf": "right_front_joint3",
+    "FR_wheel": "right_front_joint4",
+    "FL_hip": "left_front_joint1",
+    "FL_thigh": "left_front_joint2",
+    "FL_calf": "left_front_joint3",
+    "FL_wheel": "left_front_joint4",
+    "RR_hip": "right_hind_joint1",
+    "RR_thigh": "right_hind_joint2",
+    "RR_calf": "right_hind_joint3",
+    "RR_wheel": "right_hind_joint4",
+    "RL_hip": "left_hind_joint1",
+    "RL_thigh": "left_hind_joint2",
+    "RL_calf": "left_hind_joint3",
+    "RL_wheel": "left_hind_joint4",
+}
+
 # 电池管理（unitree_hg/BmsState_，bmsvoltage 单位 mV / current 单位 mA）
 TOPIC_BMS = "rt/bms_state"
 

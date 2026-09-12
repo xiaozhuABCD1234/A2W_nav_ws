@@ -106,5 +106,17 @@
       { "parent": "a2w/base", "child": "a2w/lidar", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0] },
       { "parent": "a2w/base", "child": "a2w/imu", "xyz": [0.0, 0.0, 0.0], "rpy": [0.0, 0.0, 0.0] }
     ]
+  },
+
+  "display": {
+    "enabled": true,
+    "input_topic": "a2w/joint_states",
+    "output_topic": "joint_states",
+    "rate_hz": 50.0,
+    "stale_sec": 2.0,
+    "frame_id": "",
+    "flip": [],
+    "urdf": "",
+    "rviz_config": ""
   }
 }

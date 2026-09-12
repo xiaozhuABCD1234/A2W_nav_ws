@@ -133,6 +133,19 @@ DEFAULTS: dict[str, Any] = {
         "dds_topic": TOPIC_SPORT_STATE,
         "rate_hz": 10.0,          # 输出限频（机器人侧 ~300 Hz）
     },
+    "display": {
+        # 在 RViz 里用 a2w_description 的 URDF 显示**真实关节角**（纯只读，见
+        # launch/a2w_joint_display.launch.py 与 a2w_bridge/joint_relay.py）
+        "enabled": True,
+        "input_topic": "a2w/joint_states",  # 桥发布的 SDK 命名关节角
+        "output_topic": "joint_states",     # robot_state_publisher 订阅的 URDF 命名关节角
+        "rate_hz": 50.0,                     # 限频（桥上 ~1.1 kHz，RSP 不需要那么快）
+        "stale_sec": 2.0,                    # 超过这么久没新数据就暂停发布（免定格假姿态）
+        "frame_id": "",                      # 空 = 沿用输入消息的 frame_id
+        "flip": [],                          # 需要反号的 SDK 关节名（RViz 里腿方向反了再加）
+        "urdf": "",                          # 空 = a2w_description 包里的 a2w_description.urdf
+        "rviz_config": "",                   # 空 = a2w_description 包里的 urdf.rviz
+    },
     "sensors": {
         "slam_info": {"enabled": True, "topic": "a2w/slam_info"},
         "slam_key_info": {"enabled": True, "topic": "a2w/slam_key_info"},
@@ -252,6 +265,17 @@ def _normalize(cfg: dict[str, Any]) -> None:
     sport["enabled"] = bool(sport.get("enabled", True))
     sport["rate_hz"] = _num(float, "sport_state.rate_hz", sport.get("rate_hz", 10.0) or 10.0)
 
+    disp = cfg["display"]
+    disp["enabled"] = bool(disp.get("enabled", True))
+    disp["input_topic"] = str(disp.get("input_topic", "a2w/joint_states") or "a2w/joint_states")
+    disp["output_topic"] = str(disp.get("output_topic", "joint_states") or "joint_states")
+    disp["rate_hz"] = _num(float, "display.rate_hz", disp.get("rate_hz", 50.0) or 50.0)
+    disp["stale_sec"] = _num(float, "display.stale_sec", disp.get("stale_sec", 2.0) or 2.0)
+    disp["frame_id"] = str(disp.get("frame_id", "") or "")
+    disp["flip"] = _as_list(disp.get("flip"))
+    disp["urdf"] = str(disp.get("urdf", "") or "")
+    disp["rviz_config"] = str(disp.get("rviz_config", "") or "")
+
     cfg["collector"]["port"] = _num(int, "collector.port", cfg["collector"].get("port", DEFAULT_PORT) or DEFAULT_PORT)
     cfg["collector"]["connect_timeout_sec"] = _num(
         float, "collector.connect_timeout_sec", cfg["collector"].get("connect_timeout_sec", 60.0) or 60.0
@@ -328,6 +352,21 @@ def validate(cfg: dict[str, Any]) -> None:
     if cfg["sport_state"]["enabled"] and cfg["sport_state"]["rate_hz"] <= 0:
         raise ConfigError("sport_state.rate_hz 必须 > 0")
 
+    disp = cfg["display"]
+    if disp["rate_hz"] <= 0:
+        raise ConfigError("display.rate_hz 必须 > 0")
+    if disp["stale_sec"] <= 0:
+        raise ConfigError("display.stale_sec 必须 > 0")
+    bad_flip = [n for n in disp["flip"] if n not in A2W_JOINT_NAMES]
+    if bad_flip:
+        raise ConfigError(
+            f"display.flip 含未知关节名 {bad_flip}；可用: {list(A2W_JOINT_NAMES)}"
+        )
+    if disp["enabled"] and not joints.get("enabled", True):
+        raise ConfigError(
+            "display.enabled=true 需要 joints.enabled=true（关节角来自 joints 那路 rt/lowstate 订阅）"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 路径解析
@@ -393,11 +432,13 @@ def describe(cfg: dict[str, Any]) -> str:
     joint_desc = f"关节({len(joints['names'])}" if joints.get("enabled") else "关节(关"
     joint_desc = f"{joint_desc}个)"
     battery = "电池" if cfg["battery"].get("enabled") else "电池(关)"
+    disp = cfg.get("display", {})
+    display = f"显示={disp.get('rate_hz', 50.0):g}Hz" if disp.get("enabled") else "显示(关)"
     ros = cfg["ros"]
     iso = f"ROS域={ros['domain_id']}(隔离)" if ros.get("isolate") else "ROS域未隔离"
     return (
         f"iface={cfg['iface']} 点云={cloud} IMU={imu['source'] if imu['enabled'] else '关闭'} "
-        f"{joint_desc} {battery} {iso} 配置文件={cfg.get('_config_path')}"
+        f"{joint_desc} {battery} {display} {iso} 配置文件={cfg.get('_config_path')}"
     )
 
 

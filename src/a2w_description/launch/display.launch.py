@@ -1,3 +1,17 @@
+"""a2w_description 的 URDF 显示启动器（滑条/假值，纯离线看模型）。
+
+    ros2 launch a2w_description display.launch.py            # joint_state_publisher_gui 拖滑条
+
+⚠️ 本启动器**不接实机**：关节角来自 joint_state_publisher_gui 的滑条。
+   想看**实机关节角**（只读、不控制），用桥接包里的显示启动器：
+
+       source src/a2w_bridge/scripts/a2w_env.sh
+       ros2 launch a2w_bridge a2w_joint_display.launch.py
+
+   它会把 /a2w/joint_states（SDK 名）转成 URDF 名喂给 robot_state_publisher。
+   两边都要 source a2w_env.sh，因为桥默认把 ROS2 隔离在独立域（防触发机器狗软急停）。
+"""
+
 import os
 
 from launch import LaunchDescription

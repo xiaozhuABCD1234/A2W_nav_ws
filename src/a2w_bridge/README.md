@@ -71,9 +71,61 @@ idx 12..15 = 4 个轮足（GO2W/B2W 也是“腿关节在前、轮在后”，�
 - 默认出口 16 个关节；`joints.names` / `joints.indexes` 可改（例如只出 12 个腿关节）。
   轮足内部顺序（12~15 各自对应哪条腿）官方文档没写，默认按腿序 FR/FL/RR/RL；
   单独转一个轮、看哪个索引的 q 在变即可确认，然后改 `joints.indexes`，不用改代码
-- 想喂给 `a2w_description` 的 URDF（`left_front_joint1..4` 那套名字）时注意：
-  URDF 是 SolidWorks 导出，髋/大腿的**正负方向与 SDK 惯例相反**，不能只改名字就接线，
-  需要按关节做符号换算
+- 想喂给 `a2w_description` 的 URDF（`left_front_joint1..4` 那套名字）：本包已内置映射
+  （`dds_topics.A2W_URDF_JOINT_NAMES`），**符号不需要换算** —— URDF/CAD 的限位与官方 SDK
+  完全一致（小腿 `−2.77~−0.54 rad` = −158.7°~−30.9°、大腿 `−2.34~3.15 rad` = −134°~180°），
+  实机站立/卧倒的小腿角都是负值、正好落在 URDF 的负区间内；2026-09 已在 RViz 里对实机
+  逐条腿核对通过。要用就在 RViz 里看：见下一节。
+
+## 在 RViz 里看真实关节（只读：`a2w_joint_display.launch.py`）
+
+把 `a2w_description` 的 URDF 按**实机关节角**动起来（纯只读，不发任何控制指令）：
+
+```bash
+# 终端 A：桥（提供 a2w/joint_states）
+source src/a2w_bridge/scripts/a2w_env.sh
+ros2 launch a2w_bridge a2w_bridge.launch.py
+
+# 终端 B：显示（RViz）
+source src/a2w_bridge/scripts/a2w_env.sh
+ros2 launch a2w_bridge a2w_joint_display.launch.py
+```
+
+数据流（全部只读）：
+
+```text
+rt/lowstate ─采集器(只 subscribe)─▶ /a2w/joint_states ─joint_relay─▶ /joint_states
+                                                                    └─▶ robot_state_publisher ─▶ /tf ─▶ RViz
+```
+
+`joint_relay`（`a2w_bridge/joint_relay.py`）只做三件事：
+
+1. **改名**：SDK 名 → URDF 名（`dds_topics.A2W_URDF_JOINT_NAMES`）；
+2. **限频**：按 `display.rate_hz`（默认 50 Hz）发 `/joint_states`，桥上原始是 ~1.1 kHz；
+3. **断流保护**：超过 `display.stale_sec` 没有新数据就停发并打 WARN，
+   免得 RViz 里定格一个假姿态。
+
+映射表（已在实机上逐条腿核对）：
+
+| SDK 关节名 | URDF 关节名 | 对应腿 |
+| --- | --- | --- |
+| `FR_hip/thigh/calf/wheel` | `right_front_joint1/2/3/4` | 右前 |
+| `FL_hip/thigh/calf/wheel` | `left_front_joint1/2/3/4` | 左前 |
+| `RR_hip/thigh/calf/wheel` | `right_hind_joint1/2/3/4` | 右后 |
+| `RL_hip/thigh/calf/wheel` | `left_hind_joint1/2/3/4` | 左后 |
+
+（URDF 前腿在 +x、左腿在 +y，与 ROS REP-103 / 宇树约定一致。）
+
+- **万一某条腿转向反了**（RViz 里膝盖朝反方向弯腰）：把该 SDK 关节名加进配置的
+  `display.flip`，或临时用 launch 参数试：
+  `ros2 launch a2w_bridge a2w_joint_display.launch.py flip:="FR_thigh,FL_thigh"`
+  —— 不用改 URDF、不用改代码。
+- 其他 launch 参数：`rviz:=false`（只发 `/tf`，不开 RViz）、`rate_hz:=100`、
+  `urdf:=<别的 URDF>`、`input_topic:=` / `output_topic:=` / `frame_prefix:=`。
+- 一致性核对方法（当时用它验证的）：RViz 的 TF 与**独立 FK 计算**逐位一致 ——
+  站立足实测 `base_link → left_front_Link4` = `[0.251, 0.154, -0.404]`
+  （用 URDF 链手算 0.2508/0.1536/−0.4045）。
+- 只想要数据不要 RViz：`ros2 run a2w_bridge joint_relay`（可带 `-p rate_hz:=30.0`）。
 
 ## 机器人状态（`a2w/status`）
 
@@ -184,6 +236,10 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生
 | `battery.enabled` / `topic` / `dds_topic` | `false`（默认关！） / `a2w/battery` / `rt/bms_state` | 电池（mV/mA 自动换成 V/A）。**默认关**：本机实测订阅 `rt/bms_state` 会让 CycloneDDS 0.10.2 约 25s 后段错误（固件侧 XTypes 类型不兼容），代码路径完整保留，待 SDK/固件问题解决后再开 |
 | `ros.isolate` / `domain_id` / `fastdds_profile` | `true` / `42` / `fastdds_iso.xml` | **ROS2 与机器人控制网的隔离**（见上一节）。`domain_id` 不能是 0，否则配置直接报错 |
 | `sport_state.enabled` / `topic` / `dds_topic` / `rate_hz` | `true` / `a2w/sport_state` / `rt/sportmodestate` / `10.0` | 只读运控状态机（1001=阻尼/软急停）；机器人侧 ~300 Hz，输出限频 |
+| `display.enabled` / `input_topic` / `output_topic` | `true` / `a2w/joint_states` / `joint_states` | RViz 显示用的关节转发（SDK 名 → URDF 名），见「在 RViz 里看真实关节」 |
+| `display.rate_hz` / `stale_sec` | `50.0` / `2.0` | `/joint_states` 限频与断流保护（秒） |
+| `display.flip` | `[]` | 需要反号的 SDK 关节名列表（RViz 里腿方向反了才加） |
+| `display.frame_id` / `urdf` / `rviz_config` | 留空 | frame_id 留空=沿用桥上；urdf/rviz_config 留空=用 `a2w_description` 包里的 |
 | `sensors.*.enabled` | 各传感器开关 | slam_info / slam_key_info / global_map |
 | `sensors.*.topic` | | 各传感器输出话题 |
 | `sensors.*.frame_id` | 留空=跟随机器人 | 非空则覆盖机器人消息里的 frame_id |
@@ -241,6 +297,15 @@ foxy/humble，与本机 Lyrical（默认 FastDDS）不兼容，且 A2W 的
 
 ## 常见问题
 
+- **RViz 里关节不动 / 一直定格同一个姿态** → ① 先确认桥在跑、且**本终端也在隔离域**
+  （`source src/a2w_bridge/scripts/a2w_env.sh`）；② `ros2 topic hz /joint_states` 应为 50 Hz；
+  ③ 没数据时 `joint_relay` 会打 WARN 并在超过 `display.stale_sec` 后**停发**（设计如此，
+  免得显示假姿态）。
+- **RViz 里某条腿转向和实机相反** → 在 `display.flip` 里加那条腿的 SDK 关节名
+  （如 `["FR_calf"]`），或临时 `ros2 launch a2w_bridge a2w_joint_display.launch.py flip:="FR_calf"`。
+- **RViz 里只有网格没有狗** → `robot_state_publisher` 没起来（看显示启动器日志），或
+  `a2w_description` 没编译（`colcon build --packages-select a2w_description`）；
+  网格路径用的是 `package://a2w_description/meshes/...`，RViz 靠 ament index 解析。
 - **一执行 `ros2 topic echo …` 机器狗就进软急停（阻尼）** → 是 **ROS2(FastDDS) 与机器人控制网的
   干扰**，不是你在做底层控制：`ros2 topic echo` 会让主机 DDS 域 0 的发现组播（239.255.0.1，
   含类型对象）打到 `192.168.123.0/24` —— 官方写明的“DDS控制信号”网；机器人侧 CycloneDDS 0.10.2

@@ -5,7 +5,7 @@ ROS2 (Lyrical) 工作空间,当前包含:
 | 包 | 内容 | 状态 |
 | --- | --- | --- |
 | `a2w_bridge` | **A2W 机器人 → ROS2 桥接**:点云 / IMU / 关节状态(16 关节含轮足) / 电池 / SLAM 广播 / 栅格,全部标准 ROS2 消息,行为由 JSON 配置(网卡、点云源 fused/front/rear、IMU 源等) | ✅ 本机实测可用 |
-| `a2w_description` | A2W URDF/网格与显示 launch(轮式 X2-0807) | 新增 |
+| `a2w_description` | A2W URDF/网格与显示 launch(轮式 X2-0807);要看**实机关节角**,用 `a2w_bridge` 的 `a2w_joint_display.launch.py` | 新增 |
 | `mid360_bringup` | MID360 点云 + Point-LIO 周边集成(launch/config) | 原有 |
 | `point_lio_ros2` / `livox_ros_driver2` | 上游包 | 原有 |
 
@@ -33,6 +33,9 @@ ros2 topic hz /a2w/joint_states      # 16 关节(需机器人底层服务在跑)
 ros2 topic echo /a2w/sport_state --once  # 运控状态机(error_code 1001=阻尼/软急停)
 ros2 topic echo /a2w/status --once   # 机器人状态: 运控/模式/关节新鲜度
 ip maddr show $IF | grep 239.255.0.1 # 期望无输出 = 隔离生效
+
+# 5) (可选)RViz 里按实机关节角看 URDF(只读,另开一个终端;同样先 source a2w_env.sh)
+ros2 launch a2w_bridge a2w_joint_display.launch.py
 ```
 
 详见 [`src/a2w_bridge/README.md`](src/a2w_bridge/README.md)。
