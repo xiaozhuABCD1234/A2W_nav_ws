@@ -87,11 +87,6 @@ def generate_launch_description() -> LaunchDescription:
                 profile,
                 condition=IfCondition(isolate),
             ),
-            SetEnvironmentVariable(
-                "FASTRTPS_DEFAULT_PROFILES_FILE",
-                profile,
-                condition=IfCondition(isolate),
-            ),
             LogInfo(
                 msg=[
                     "[a2w_bridge] ROS 已隔离: domain=",

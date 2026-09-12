@@ -12,10 +12,13 @@
 
   用法：
     export FASTDDS_DEFAULT_PROFILES_FILE=/path/to/fastdds_iso.xml
-    （旧版 FastDDS 也认 FASTRTPS_DEFAULT_PROFILES_FILE；本包两个都设）
     直接 `source src/a2w_bridge/scripts/a2w_env.sh` 最省事。
 
   注意：
+    * 旧发行版（Humble / FastDDS 2.x）只认已废弃的 FASTRTPS_DEFAULT_PROFILES_FILE；
+      本机 Lyrical（FastDDS 3.6）用 FASTDDS_DEFAULT_PROFILES_FILE，
+      这时再设 FASTRTPS_* 会每进程打一条 deprecation WARN，所以默认不设；
+      旧版环境请 `A2W_LEGACY_FASTRTPS=1 source .../a2w_env.sh`。
     * 本机所有需要看 /a2w/* 话题的 ROS2 工具（rviz2、point_lio、ros2 CLI 等）
       都要带上同样的环境变量 + 同一个 ROS_DOMAIN_ID，否则互相看不见；
     * 机器人数据不经过 ROS2 DDS（采集器 CycloneDDS → TCP → 节点），所以隔离后
