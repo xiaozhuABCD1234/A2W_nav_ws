@@ -51,8 +51,10 @@
       "intensity"
     ],
     "max_points": 0,
+    "min_range": 0.0,
     "max_range": 0.0,
-    "voxel": 0.0
+    "voxel": 0.0,
+    "filter_zero": true
   },
   "imu": {
     "enabled": true,

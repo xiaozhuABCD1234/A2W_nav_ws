@@ -97,11 +97,22 @@ source src/a2w_bridge/scripts/a2w_env.sh      # ROS_DOMAIN_ID=42 + FastDDS 只�
 ros2 topic echo /a2w/joint_states --once
 ```
 
-验证隔离是否生效（机器人网卡上不应再出现 DDS 组播）：
+验证隔离是否生效（实测方法见下）：
 
 ```bash
-ip maddr show enx00e04c2c4260 | grep 239.255.0.1     # 期望：无输出
+# ① ROS2/FastDDS 侧只应在**回环**加入该组播（users 数 ≈ 你的 ROS2 进程数）
+ip maddr show lo | grep 239.255.0.1
+
+# ② 机器人网卡上**会**有 239.255.0.1 —— 那是采集器的 CycloneDDS（机器人自己的 DDS 域 0），
+#    它就是靠这个收机器人数据的，属于设计内。想确认那几条确实只是采集器：
+#    （杀掉采集器后 0.5 s 内看，随后监督器会把它重启）
+pkill -9 -f 'collector.py --config'; sleep 0.5
+ip maddr show enx00e04c2c4260 | grep 239.255.0.1 || echo '已消失 = 确实只是采集器，ROS2 没漏'
 ```
+
+⚠️ 别把②当成“隔离失效”：判据是**ROS2 侧有没有把发现包发到那张网卡**。本机实测：
+五个 ROS2 进程（桥/LIO/RViz 生态）只在 `lo` 上加入该组播；机器人网卡上那两条来自采集器，
+杀掉采集器就立刻消失。
 
 > **为什么可以彻底隔离**：机器人数据不走 ROS2 DDS——采集器(CycloneDDS，只读订阅) → TCP →
 > ROS2 节点，ROS2 侧纯属本机消费，根本不需要碰机器人网络。
@@ -131,8 +142,99 @@ ros2 launch a2w_bridge a2w_points_rviz.launch.py rviz_config:=/path/my.rviz
   或 RViz 里 Add 三个 PointCloud2
 - 改话题名/坐标系/点大小：直接编辑这份 rviz 配置（RViz 里改完也可另存）
 - 关掉 RViz 窗口 = 整个 launch 退出（参照文件里那段被注释掉的 `OnProcessExit` 写法）
-- ⚠️ 实测提醒：默认输出里约 35% 的点是雷达无回波的 `(0,0,0)`，在 RViz 里会表现为
-  传感器中心一个很密的亮点团；要丢掉需要加 `min_range` 类过滤（本包暂无，见 FAQ）
+- ⚠️ 实测提醒：单帧 115200 点里 **68%** 是雷达无回波的 `(0,0,0)`（机器人把 128×900 网格整帧发过来），
+  不丢就会在传感器中心形成一个很密的亮点团。本包默认 `pointcloud.filter_zero: true` 已经把它们丢掉了；
+  还嫌近处脏就加 `pointcloud.min_range`（去自车体/轮子回波），见「常见问题」第一条
+
+## 喂给 Point-LIO（`a2w_lio.launch.py` + `config/a2w_bridge_lio.json`）
+
+一条命令 = 桥（LIO 配置）+ Point-LIO（+ 可选 RViz）：
+
+```bash
+ros2 launch a2w_bridge a2w_lio.launch.py                  # 桥 + LIO + RViz
+ros2 launch a2w_bridge a2w_lio.launch.py show_rviz:=false  # 无窗口（看日志 / 存 PCD 时用）
+ros2 launch a2w_bridge a2w_lio.launch.py lio:=false        # 只起桥（LIO 自己另开终端起）
+ros2 launch a2w_bridge a2w_lio.launch.py pcd_save:=true    # Ctrl+C 退出时把建图点云写 ./PCD/scans.pcd
+```
+
+数据流（全程只读，不下发任何控制指令）：
+
+```text
+rt/unitree/slam_lidar/points1 ─采集器─▶ /a2w/points ─┐
+rt/unitree/slam_lidar/imu1    ─采集器─▶ /a2w/imu    ─┴─▶ point_lio（config/a2w.yaml）
+                                                          └─▶ /cloud_registered(_body)、/path、TF camera_init→body
+```
+
+不想一键，也可以两边分开起（两个终端都要先 `source src/a2w_bridge/scripts/a2w_env.sh`）：
+
+```bash
+# 终端 1：桥（关键是带上 LIO 那份配置）
+ros2 launch a2w_bridge a2w_bridge.launch.py config:=$(ros2 pkg prefix --share a2w_bridge)/config/a2w_bridge_lio.json
+# 终端 2：Point-LIO
+ros2 launch point_lio mapping_a2w.launch.py
+```
+
+### 为什么单开一份配置：`config/a2w_bridge_lio.json`
+
+它用本包新支持的 `extends` 继承主配置（只写差异项，**标定/网卡/话题仍然只有一处真相源**），
+一共只改了三件事：
+
+| 键 | 值 | 为什么 |
+| --- | --- | --- |
+| `pointcloud.fields` | `["x","y","z","intensity","ring","timestamp"]` | Point-LIO 的 HESAI 分支要 `ring(u2) + timestamp(f8)` 才能拿逐点时间做运动补偿 |
+| `imu.source` | `lidar_front` | LIO 的外参是**单位阵**（点云与 IMU 同在前雷达坐标系）；`auto` 会降级到后雷达/本体 IMU，坐标系数说变就变，外参随即失效 |
+
+（第三件事不是配置项：默认的 `filter_zero: true` 对 LIO 同样关键 —— 零点会被当成"传感器原点处的障碍物"。）
+
+### 桥为 LIO 做的三件事
+
+1. **字段按原生类型透传**（`fields` 里写 `ring`/`timestamp` 时生效）：
+   机器人原始点云就是 Hesai 驱动那套布局 —— `x,y,z,intensity`(f4) + `ring`(**u2**) + `timestamp`(**f8**，
+   绝对 Unix 秒)，`point_step=26`。桥以前把一切都当 f4 发：f8 压成 f4 会掉到 0.1 s 级精度，
+   u2 的 ring 直接变成垃圾浮点。现在采集器按源类型打包、节点按类型发 `PointField`，
+   与 `point_lio_ros2/src/preprocess.h` 的 `hesai_ros::Point` **逐字节一致**。
+2. **点云时间戳打"帧首"**：下游把 `header.stamp` 当帧首用（Point-LIO: `lidar_end_time = 帧首 + 帧内跨度`），
+   若打"到达时刻"，LIO 的内建时钟就比物理时间晚整整一帧、姿态戳会跑到"未来"。
+   桥用点云自带的逐点绝对时间反推：`帧首 = 到达时刻 − (末点时刻 − 机器人 header.stamp)`；
+   没有 `timestamp` 字段时保持旧行为（到达时刻）。
+3. **不再白丢帧**：解码线程原先是 30 ms 轮询唤醒，实测 DDS 进 9.4 Hz、只有 8.2 Hz 发得出去（~13% 帧白丢）。
+   改成事件唤醒后，日志里 `云输出Hz[front]` 与 `cloud:front` 基本相等（都是 9.7~10.2 Hz）。
+
+### 时序诊断：`time_lag_imu_to_lidar` 不用猜
+
+周期状态行（每 5 s）里会直接量并给值：
+
+```text
+状态: ... | 点云源=front IMU源=lidar_front 点云−IMU滞后差=+42ms（LIO: time_lag=-0.042） 云输出Hz[front=9.8] | {'cloud:front': 9.9, ...}
+```
+
+- 原理：分别统计 `点云戳 − 机器人帧首戳` 与 `IMU 主机戳 − 机器人 IMU 戳`，两者都含同一个
+  机器人时钟偏差（实测与主机**差 263 s**），相减就抵消了，剩下的正是**点云比 IMU 多出来的那部分链路延迟**。
+- 用法：把括号里的值抄进 `point_lio_ros2/config/a2w.yaml` 的 `common.time_lag_imu_to_lidar`
+  （当前 **-0.042**，实测抖动 32~49 ms）。换网卡/换交换机/机器人侧改发布频率后重抄一次即可。
+- 它只影响**动态**精度（走起来才看得出），静止时与它无关。
+
+### 本机实测（2026-09-13，A2W 实机，机器人静止）
+
+| 项 | 实测 |
+| --- | --- |
+| 机器人原始点云 | 115200 点/帧（128 线 × 900），10 Hz，`point_step=26`；**68.3% 是 `(0,0,0)`** |
+| 桥输出 `/a2w/points` | 36534 点/帧，`point_step=26`，`ring` u2 0~127，`timestamp` f8 帧内跨度 99.8 ms |
+| 桥输出 `/a2w/imu` | 前雷达 IMU ~200 Hz，加速度模长 9.85（**m/s²**，重力在 +Y） |
+| Point-LIO 输出 | `/cloud_registered` 10.1 Hz、`/path` 10.5 Hz、`/aft_mapped_to_init` 10.3 Hz |
+| 精度 | 静止 30 s 位置漂移 **2.3 mm**（逐帧位移中位 4 mm），姿态戳落后墙钟 63 ms（= 传输+发布延迟，物理正确） |
+| 资源 | `pointlio_mapping` CPU **23%**、RSS 186 MB |
+
+> 还**没有**在机器人行走/转向时实测过（那需要有人遥控它），走起来才是真正的验收；
+> 如果发现转向时点云有拖影，优先看 `point_lio_ros2/config/a2w.yaml` 里的 `time_lag_imu_to_lidar`
+> 与 `preprocess.blind`（后者负责丢掉腿/轮子回波）。
+
+### 在本机编译 point_lio 的坑（LOCAL PATCH P10）
+
+本工作区此前**从未成功编译过 C++ 包**，因为本机 ROS（Lyrical，`ament_cmake 2.8.8`）已经
+**删除 `ament_target_dependencies` 宏**，而 CMake 4 也删了 `FindPythonLibs`（CMP0148）——
+上游 `point_lio` 两处都还在用。已在 `point_lio_ros2/CMakeLists.txt` 就地补上（语义不变，见文件里的
+`LOCAL PATCH P10` 注释），`colcon build --symlink-install --packages-select point_lio` 即可通过。
 
 ## 关节（`a2w/joint_states`）
 
@@ -286,7 +388,7 @@ ros2 launch a2w_bridge a2w_bridge.launch.py config:=/path/to/my.json
 ros2 topic hz a2w/points a2w/imu
 ros2 topic echo /a2w/joint_states --once    # 16 关节（需机器人底层服务在跑）
 ros2 topic echo /a2w/status --once         # 运控状态机/关节新鲜度
-ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生效）
+ip maddr show lo | grep 239.255.0.1         # ROS2 只在回环组播（机器人网卡上那条属采集器，见「ROS 域隔离」）
 ```
 
 `unitree_sdk2py` 源码路径：`collector.sdk_path`（默认优先 `~/Downloads/unitree_sdk2_python`
@@ -312,8 +414,10 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生
 | `pointcloud.failover_order` | `["fused","front","rear"]` | `auto` 时的轮换顺序（无数据超过 `stale_sec` 换下一个） |
 | `pointcloud.stale_sec` | `6.0` | 多少秒收不到数据判定“断了” |
 | `pointcloud.topic` / `frame_id` | `a2w/points` / `a2w/lidar` | `single` 模式输出话题与坐标系 |
-| `pointcloud.fields` | `["x","y","z","intensity"]` | PointCloud2 输出字段（可加 `ring`/`timestamp`） |
+| `pointcloud.fields` | `["x","y","z","intensity"]` | PointCloud2 输出字段（可加 `ring`/`timestamp`）。**字段按源原生类型发**：`ring`→u2、`timestamp`→f8（绝对 Unix 秒）、坐标/强度→f4；要喂 Point-LIO 就看上一节 |
 | `pointcloud.max_points` / `max_range` / `voxel` | `0`=关闭 | 每帧随机抽稀 / 距离裁剪（米）/ 体素下采样（米） |
+| `pointcloud.filter_zero` | `true`（默认开） | 丢掉机器人填的 `(0,0,0)` 无效点——见「常见问题」第一条（实测占单帧 **68%**） |
+| `pointcloud.min_range` | `0.0`=关闭 | 丢掉比该距离更近的点（米）：去自车体/轮子回波时用 |
 | `imu.enabled` | `true` | 是否发布 IMU |
 | `imu.source` | `auto`（默认，front→rear→lowstate 自动降级）/ `all`（三路各发各的话题）/ `lidar_front` / `lidar_rear` / `lowstate` | IMU 来源 |
 | `imu.topic` / `frame_id` | `a2w/imu` / `a2w/imu` | `auto` 与单源模式的输出话题 |
@@ -332,6 +436,7 @@ ip maddr show enx00e04c2c4260 | grep 239.255.0.1   # 期望无输出（隔离生
 | `sensors.*.frame_id` | 留空=跟随机器人 | 非空则覆盖机器人消息里的 frame_id |
 | `tf.transforms` | base→lidar、base→imu（单位阵） | 静态 TF 列表，按实机安装尺寸改 `xyz`/`rpy`（弧度） |
 | `publish_status_period_sec` | `5.0` | 状态帧周期 |
+| `extends` | 如 `"a2w_bridge.json"` | **配置继承**（相对本文件目录）：先读被继承的那份，再把本文件的键合上去（数组整个替掉）。用来只写差异项：`config/a2w_bridge_lio.json` 就只改了 `fields` 与 `imu.source`，标定/网卡仍只有一处真相源 |
 
 ### ⚠️ 链路是最重要的约束（改动配置前必读）
 
@@ -385,9 +490,12 @@ foxy/humble，与本机 Lyrical（默认 FastDDS）不兼容，且 A2W 的
 
 ## 常见问题
 
-- **RViz 里点云中心有个密集亮点团** → 雷达无回波的 `(0,0,0)` 无效点（实测占单帧 35%），
-  本包只丢 NaN/inf、不丢零点；要清掉得加 `pointcloud.min_range`（现在没有这个开关），
-  或在上游（`point_lio`/`pcl`）过滤。
+- **RViz 里点云中心有个密集亮点团 / 下游把原点当障碍物** → 雷达把**没回波的格子填 `(0,0,0)`**：
+  机器人整帧发的是 **128×900 固定网格**（115200 点），实测（前雷达 `points1`）其中 **78750 个是零点 = 68%**，
+  且 `is_dense=true`（在骗人）。本包默认 `pointcloud.filter_zero: true` 把它们丢掉
+  （启动日志会打一行 `点云 front: 原始 115200 → 输出 3xxxx 点（丢掉 …%）`）。
+  还嫌近处脏就再加 `pointcloud.min_range`（如 `0.3`）去自车体/轮子回波；
+  想看原始帧就设 `filter_zero: false`。
 - **`a2w_points_rviz.launch.py` 里 RViz 空的 / 没有点** → ① 确认起 launch 的终端已
   `source src/a2w_bridge/scripts/a2w_env.sh`；② 确认 `Fixed Frame`（默认 `a2w/lidar`）
   与 JSON 的 `pointcloud.frame_id` 一致；③ 桥已在别处跑时加 `bridge:=false`。
@@ -405,7 +513,8 @@ foxy/humble，与本机 Lyrical（默认 FastDDS）不兼容，且 A2W 的
   含类型对象）打到 `192.168.123.0/24` —— 官方写明的“DDS控制信号”网；机器人侧 CycloneDDS 0.10.2
   遇到跨实现类型对象会出问题，运控随即落到阻尼（官方 `error_code` **1001** = 软急停）。
   **修复：`source src/a2w_bridge/scripts/a2w_env.sh`**（launch 默认已对节点做同样隔离），
-  再用 `ip maddr show <机器人网卡> | grep 239.255.0.1` 确认无输出。
+  再用 `ip maddr show lo | grep 239.255.0.1` 确认 ROS2 只在回环组播（机器人网卡上那条属采集器，
+  见「ROS 域隔离」）。
   注意 `ROS_LOCALHOST_ONLY=1` 在本机 FastDDS 3.6 实测**无效**，要用包里的 `config/fastdds_iso.xml`。
   监视是否再次发生：`ros2 topic echo /a2w/sport_state --once`（`error_code=1001` 就是软急停）。
 - **点云一个字节都收不到、但 IMU 正常** → 多半是链路被打满或网卡选错。

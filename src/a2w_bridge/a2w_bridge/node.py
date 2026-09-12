@@ -55,6 +55,31 @@ from .dds_topics import CLOUD_TOPICS, IMU_TOPICS
 
 HEADER_FIELDS = ("x", "y", "z", "intensity")
 
+# 采集器透传的 numpy 字段类型 -> PointCloud2 PointField.datatype（以及字节数）。
+# 只列本桥会输出的字段类型：坐标/强度 f4、ring u2、timestamp f8（绝对 Unix 秒）。
+# 为什么不再把一切都当 f4：Point-LIO 的 HESAI 分支按 double timestamp + uint16 ring 读点，
+# f8 的绝对秒压成 f4 会掉到 0.1 s 级精度，u2 会被当垃圾浮点。
+_POINT_FIELD_TYPES = {
+    "f4": PointField.FLOAT32,
+    "f8": PointField.FLOAT64,
+    "i1": PointField.INT8,
+    "u1": PointField.UINT8,
+    "i2": PointField.INT16,
+    "u2": PointField.UINT16,
+    "i4": PointField.INT32,
+    "u4": PointField.UINT32,
+}
+_POINT_FIELD_SIZES = {
+    "f4": 4,
+    "f8": 8,
+    "i1": 1,
+    "u1": 1,
+    "i2": 2,
+    "u2": 2,
+    "i4": 4,
+    "u4": 4,
+}
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     """防御性 float 转换（帧数据不可信）。"""
@@ -145,6 +170,7 @@ class A2WBridgeNode(Node):
     # ------------------------------------------------------------ 发布器
     def _make_publishers(self) -> None:
         self._pub: dict[str, Any] = {}
+        self._cloud_logged: dict[str, bool] = {}  # 每路点云只印一次“原始点数 → 过滤后点数”
         pc = self.cfg["pointcloud"]
         if pc.get("enabled", True):
             if pc["mode"] == "multi":
@@ -348,29 +374,46 @@ class A2WBridgeNode(Node):
         pub = self._pub.get(f"cloud:{key}")
         if pub is None:
             return
-        fields = header.get("fields") or ["x", "y", "z"]
+        fields = [str(f) for f in (header.get("fields") or ["x", "y", "z"])]
         n = _i(header.get("points", 0))
-        pts = len(payload) // 4 // len(fields)
         msg = PointCloud2()
         msg.header.stamp = ros_time(_f(header.get("ts")))
         msg.header.frame_id = self.cfg["pointcloud"]["frame_id"]
         msg.height = 1
         msg.width = n
-        msg.fields = [
-            PointField(
-                name=name,
-                offset=i * 4,
-                datatype=PointField.FLOAT32,
-                count=1,
+        # 字段类型由采集器透传过来（与源字段原生类型一致：x/y/z/intensity=f4、
+        # ring=u2、timestamp=f8）。老版本采集器没有 field_dtypes，则回退到全 f4。
+        dtypes = [str(d) for d in (header.get("field_dtypes") or [])]
+        if len(dtypes) != len(fields):
+            dtypes = ["f4"] * len(fields)
+        offset = 0
+        point_fields = []
+        for name, dt in zip(fields, dtypes):
+            point_fields.append(
+                PointField(
+                    name=name,
+                    offset=offset,
+                    datatype=_POINT_FIELD_TYPES.get(dt, PointField.FLOAT32),
+                    count=1,
+                )
             )
-            for i, name in enumerate(fields)
-        ]
+            offset += _POINT_FIELD_SIZES.get(dt, 4)
+        msg.fields = point_fields
         msg.is_bigendian = False
-        msg.point_step = 4 * len(fields)
+        msg.point_step = offset
         msg.row_step = msg.point_step * msg.width
         msg.data = payload
         msg.is_dense = True
         pub.publish(msg)
+
+        raw = _i(header.get("points_raw", 0))
+        if raw > n and not self._cloud_logged.get(key):
+            # 首次收到该源时说明过滤效果（机器人整帧发 128×900 网格，没回波的格子填 (0,0,0)）
+            self._cloud_logged[key] = True
+            self.get_logger().info(
+                f"点云 {key}: 原始 {raw} → 输出 {n} 点"
+                f"（丢掉 {raw - n} 个零点/越界点，{100.0 * (raw - n) / raw:.1f}%）"
+            )
 
     def _on_imu(self, header: dict[str, Any]) -> None:
         key = str(header.get("k", ""))

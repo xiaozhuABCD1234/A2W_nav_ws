@@ -24,6 +24,9 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
+  <!-- a2w_lio.launch.py 会 include point_lio 的 mapping_a2w.launch.py（一键起 LIO）；
+       本包本身只是桥，不依赖 point_lio 的构建产物，所以只声明 exec 依赖。 -->
+  <exec_depend>point_lio</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -62,6 +62,13 @@ _FIELD_DTYPE = {
     8: ("f8", 8),
 }
 
+# 本桥输出用的字段类型白名单（字段名 -> numpy 字符）。
+# 为什么输出要带类型、而且不统一成 f4：Point-LIO 的 HESAI 分支按
+# ``double timestamp`` + ``uint16 ring`` 读点（见 point_lio_ros2/src/preprocess.h
+# 的 hesai_ros::Point）。把 f8 的**绝对 Unix 秒**压成 f4 会掉到 0.1 s 级精度、
+# 把 u2 的 ring 当 f4 会变成 NaN 一样的垃圾值 —— 所以按源字段的原生类型透传。
+CLOUD_FIELD_KINDS = {"x", "y", "z", "intensity", "ring", "timestamp"}
+
 
 def log(text: str) -> None:
     """写 stderr（由 ROS2 节点转发进 ROS 日志）。"""
@@ -71,13 +78,45 @@ def log(text: str) -> None:
 # ---------------------------------------------------------------------------
 # 点云解析 / 滤波
 # ---------------------------------------------------------------------------
-def cloud_to_array(msg: Any, fields: list[str]) -> tuple[np.ndarray, list[str]]:
-    """``sensor_msgs/PointCloud2`` -> ``(N, K)`` float32 数组（按 fields 顺序取列）。"""
+def _packed_dtype(names: list[str], dtypes: list[str]) -> np.dtype:
+    """按 ``[(名称, '<类型')]`` 造**紧凑无填充**的结构化 dtype（一个点 = itemsize 字节）。"""
+    return np.dtype([(n, "<" + d) for n, d in zip(names, dtypes)])
+
+
+def _xyz(points: np.ndarray) -> np.ndarray:
+    """结构化点云 -> ``(N, 3)`` float64 坐标（只给滤波用，不动原数组）。"""
+    return np.stack((points["x"], points["y"], points["z"]), axis=1).astype(np.float64)
+
+
+def cloud_to_array(
+    msg: Any, fields: list[str], *, warn: Any = None
+) -> tuple[np.ndarray, list[str], list[str]]:
+    """``sensor_msgs/PointCloud2`` -> ``(结构化数组, 字段名, 字段类型)``。
+
+    按 ``fields`` 顺序取列，**保持源字段的原生数值类型**（只把字节序统一成小端）：
+    ``x/y/z/intensity`` 一般是 f4、``ring`` 是 u2、``timestamp`` 是 f8（绝对 Unix 秒）。
+    下游 ``node.py`` 会按这里的类型发布 PointField，Point-LIO 的 HESAI 分支才能正确读。
+
+    ``warn``：可选回调（收到“源里没有这个字段”的提示文本）—— 只在第一次出现时由调用方去重。
+    """
     by_name = {f.name: f for f in msg.fields}
     names = [n for n in fields if n in by_name]
+    missing = [n for n in fields if n not in by_name]
+    if missing and warn is not None:
+        warn(f"源点云没有字段 {missing}（现有: {list(by_name)}），本次已跳过")
     for axis in ("x", "y", "z"):
         if axis not in names:
             raise ValueError(f"点云缺少字段 {axis!r}（现有: {list(by_name)}）")
+
+    dtypes: list[str] = []
+    for name in names:
+        try:
+            dtypes.append(_FIELD_DTYPE[int(by_name[name].datatype)][0])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                f"字段 {name!r} 的 datatype 非法: {by_name[name].datatype!r}"
+            ) from None
+    layout = _packed_dtype(names, dtypes)
 
     try:
         point_step = int(msg.point_step)
@@ -88,7 +127,7 @@ def cloud_to_array(msg: Any, fields: list[str]) -> tuple[np.ndarray, list[str]]:
         raise ValueError(f"点云字段 point_step/width/height/row_step 非法: {exc}") from None
     total = width * height
     if total == 0 or point_step == 0:
-        return np.zeros((0, len(names)), dtype=np.float32), names
+        return np.zeros(0, dtype=layout), names, dtypes
 
     buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
     if row_step <= width * point_step or height <= 1:
@@ -103,34 +142,64 @@ def cloud_to_array(msg: Any, fields: list[str]) -> tuple[np.ndarray, list[str]]:
         arr = np.vstack(rows)
 
     endian = ">" if bool(msg.is_bigendian) else "<"
-    out = np.empty((arr.shape[0], len(names)), dtype=np.float32)
-    for i, name in enumerate(names):
+    out = np.empty(arr.shape[0], dtype=layout)
+    for name, dt in zip(names, dtypes):
         field = by_name[name]
         try:
-            dt, size = _FIELD_DTYPE[int(field.datatype)]
+            _, size = _FIELD_DTYPE[int(field.datatype)]
             offset = int(field.offset)
         except (KeyError, TypeError, ValueError):
             raise ValueError(
                 f"字段 {name!r} 的 datatype/offset 非法: {field.datatype!r}@{field.offset!r}"
             ) from None
-        out[:, i] = arr[:, offset : offset + size].copy().view(endian + dt).reshape(-1).astype(np.float32)
+        # astype 顺带把小端/大端与目标类型都归一化（int -> float 也可以）
+        col = arr[:, offset : offset + size].copy().view(endian + dt).reshape(-1)
+        out[name] = col.astype(out.dtype[name], copy=False)
 
     if out.size:
-        out = out[np.isfinite(out).all(axis=1)]
-    return out, names
+        # 只对坐标判有效：其它字段（intensity/ring/timestamp）可能是任意数值
+        with np.errstate(invalid="ignore"):
+            finite = np.isfinite(out["x"]) & np.isfinite(out["y"]) & np.isfinite(out["z"])
+        out = out[finite]
+    return out, names, dtypes
 
 
-def crop_range(points: np.ndarray, max_range: float) -> np.ndarray:
-    if max_range <= 0 or points.shape[0] == 0:
+def drop_zero_points(points: np.ndarray) -> np.ndarray:
+    """丢掉机器人填的 ``(0,0,0)`` 无效点。
+
+    机器人（JT128 固件）把 **128×900 的固定网格**（115200 点）整帧发过来，没有回波的格子填
+    ``(0,0,0)``，而且 ``is_dense=true`` —— 实机实测这类点占 **68.4%**。不过滤的话，下游
+    （Point-LIO、costmap、RViz）会把它们当成“传感器原点处的障碍物”。只比 xyz 三列，
+    ``intensity`` 不参与判定。
+    """
+    if points.shape[0] == 0:
         return points
-    return points[np.linalg.norm(points[:, :3], axis=1) <= max_range]
+    keep = ~(
+        (points["x"] == 0.0) & (points["y"] == 0.0) & (points["z"] == 0.0)
+    )
+    return points[keep]
+
+
+def crop_range(points: np.ndarray, max_range: float, min_range: float = 0.0) -> np.ndarray:
+    """按到原点距离裁剪；两边都是 0 = 不裁。"""
+    if points.shape[0] == 0 or (max_range <= 0 and min_range <= 0):
+        return points
+    r = np.linalg.norm(_xyz(points), axis=1)
+    keep = np.ones(points.shape[0], dtype=bool)
+    if max_range > 0:
+        keep &= r <= max_range
+    if min_range > 0:
+        keep &= r >= min_range
+    return points[keep]
 
 
 def voxel_downsample(points: np.ndarray, voxel: float) -> np.ndarray:
     """体素下采样（每个体素取一个代表点），纯 numpy：三维体素索引打包成 int64 后 1D unique。"""
     if voxel <= 0 or points.shape[0] == 0:
         return points
-    keys = np.floor(points[:, :3] / voxel).astype(np.int64)
+    # 注意：保留每个体素里**下标最小**的点并按原下标排序 → 输出仍是时间单调的，
+    # 逐点时间戳（timestamp/curvature）不会被降采样打乱顺序。
+    keys = np.floor(_xyz(points) / voxel).astype(np.int64)
     keys = np.clip(keys + (1 << 16), 0, (1 << 17) - 1)
     packed = (keys[:, 0] << 34) | (keys[:, 1] << 17) | keys[:, 2]
     _, idx = np.unique(packed, return_index=True)
@@ -200,6 +269,8 @@ class Collector:
         self.cloud_fields = list(pc["fields"])
         self.cloud_max_points = pc["max_points"]
         self.cloud_max_range = pc["max_range"]
+        self.cloud_min_range = pc["min_range"]
+        self.cloud_filter_zero = bool(pc.get("filter_zero", True))
         self.cloud_voxel = pc["voxel"]
 
         imu = cfg["imu"]
@@ -233,6 +304,18 @@ class Collector:
         self._stats: dict[str, list[float]] = {}
         self._cloud_msg: dict[str, Any] = {}     # key -> 最新原始消息（KEEP_LAST(1)）
         self._cloud_gen: dict[str, int] = {}     # key -> 收到帧序号
+        self._cloud_ts: dict[str, float] = {}    # key -> 该帧的**到达时刻**（墙钟，打时间戳用）
+        self._cloud_hdr: dict[str, float] = {}   # key -> 该帧机器人 header.stamp（帧首，机器人时钟）
+        self._cloud_field_warned: dict[str, bool] = {}  # 字段缺失提示去重（只报一次）
+        # 时序诊断（EMA）：把两路数据流的“主机墙钟 − 机器人时钟”差出来，机器人时钟
+        # 的绝对偏差（实测 263 s）会在相减时抵消，剩下的就是**点云与 IMU 的相对滞后**
+        # —— 它正是 Point-LIO 的 common.time_lag_imu_to_lidar 要补的量。
+        self._lag_cloud: float | None = None     # 点云 ts − 机器人帧首戳（含点云侧链路/解码延迟）
+        self._lag_imu: float | None = None       # IMU 主机戳 − 机器人 IMU 戳（含 IMU 侧链路延迟）
+        # 点云输出计数（解码后真正交给 ROS 节点的帧数）：与上面的 DDS 到达率对比，
+        # 差值就是桥内丢帧（同一时刻只留最新一帧是设计行为，但丢太多就要看下面这两处）。
+        self._cloud_out: dict[str, int] = {}     # key -> 累计输出帧数
+        self._cloud_out_prev: dict[str, int] = {}  # 上一报周期末值（算差值用）
         self._active_cloud = self.cloud_source if self.cloud_source != "auto" else self.cloud_order[0]
         self._active_imu = None
 
@@ -240,6 +323,9 @@ class Collector:
         self._cloud_q: deque = deque(maxlen=8)      # 点云（大帧，只保留最近几帧）
         self._q_lock = threading.Lock()
         self._q_event = threading.Event()
+        # 解码线程的唤醒信号：点云到达就置位（原来是 30 ms 轮询，实测会白白丢掉
+        # 约 13% 的帧 —— DDS 9.4 Hz 进来、只有 8.2 Hz 发得出去，见 README「点云丢帧」）。
+        self._cloud_event = threading.Event()
 
         self._last_mode: dict[str, Any] | None = None   # rt/lowstate 的 mode/tick 快照
         self._last_bms: dict[str, Any] | None = None    # rt/bms_state 快照
@@ -305,8 +391,17 @@ class Collector:
         if not self.cloud_enabled:
             return "关闭"
         if self.cloud_mode == "multi":
-            return "multi(" + ",".join(self.cfg["pointcloud"]["multi_topics"]) + ")"
-        return self._active_cloud
+            desc = "multi(" + ",".join(self.cfg["pointcloud"]["multi_topics"]) + ")"
+        else:
+            desc = self._active_cloud
+        flags = ["丢零点" if self.cloud_filter_zero else "含零点"]  # 与 config.describe 对齐
+        if self.cloud_min_range > 0:
+            flags.append(f">={self.cloud_min_range:g}m")
+        if self.cloud_max_range > 0:
+            flags.append(f"<={self.cloud_max_range:g}m")
+        if self.cloud_voxel > 0:
+            flags.append(f"voxel={self.cloud_voxel:g}")
+        return f"{desc},{','.join(flags)}"
 
     # --------------------------------------------------------------- 订阅
     def _subscribe_all(self) -> None:
@@ -460,6 +555,12 @@ class Collector:
             with self._lock:
                 now = self._touch(key)
                 active = self._active_imu
+                # 时序诊断：IMU 侧“主机戳 − 机器人戳”（雷达 IMU 的 header.stamp 是设备时间）
+                stamp = safe_float(getattr(msg.header.stamp, "sec", 0)) + \
+                    safe_float(getattr(msg.header.stamp, "nanosec", 0)) * 1e-9
+                if stamp > 0:
+                    lag = now - stamp
+                    self._lag_imu = lag if self._lag_imu is None else 0.9 * self._lag_imu + 0.1 * lag
             if self.imu_source not in ("all",) and key != active:
                 return
             self._enqueue_small(
@@ -618,9 +719,14 @@ class Collector:
     def _mk_cloud(self, key: str):
         def handler(msg: Any) -> None:
             with self._lock:
+                now = time.time()
                 self._cloud_msg[key] = msg             # 只存引用，解码在解码线程
+                self._cloud_ts[key] = now              # 到达时刻（墙钟）：解码后可能晚几十 ms
+                self._cloud_hdr[key] = safe_float(getattr(msg.header.stamp, "sec", 0)) + \
+                    safe_float(getattr(msg.header.stamp, "nanosec", 0)) * 1e-9
                 self._cloud_gen[key] = self._cloud_gen.get(key, 0) + 1
                 self._touch(f"cloud:{key}")
+            self._cloud_event.set()   # 叫醒解码线程（别等轮询）
 
         return handler
 
@@ -633,12 +739,18 @@ class Collector:
     def _enqueue_cloud(self, header: dict[str, Any], payload: bytes) -> None:
         with self._q_lock:
             self._cloud_q.append((header, payload))
+        with self._lock:
+            key = str(header.get("k", ""))
+            self._cloud_out[key] = self._cloud_out.get(key, 0) + 1
         self._q_event.set()
 
     # --------------------------------------------------------- 解码 / 看门狗
     def _decode_loop(self) -> None:
         last_gen: dict[str, int] = {}
-        while not self._stop.wait(0.03):
+        while not self._stop.is_set():
+            # 事件唤醒（不是轮询）：帧一到就解码，只剩“新帧比解码快”这一种合理丢弃
+            self._cloud_event.wait(0.05)
+            self._cloud_event.clear()
             with self._lock:
                 keys = list(self._cloud_msg)
                 jobs = []
@@ -648,8 +760,10 @@ class Collector:
                         last_gen[key] = gen
                         jobs.append((key, gen, self._cloud_msg[key]))
             for key, gen, msg in jobs:
+                with self._lock:
+                    ts = self._cloud_ts.get(key)
                 try:
-                    header, payload = self._decode_cloud(key, msg)
+                    header, payload = self._decode_cloud(key, msg, ts)
                 except Exception as exc:  # noqa: BLE001 —— 单帧解码失败不该拖垮采集
                     log(f"点云解码失败({key}): {exc}")
                     continue
@@ -658,16 +772,52 @@ class Collector:
                     continue
                 self._enqueue_cloud(header, payload)
 
-    def _decode_cloud(self, key: str, msg: Any) -> tuple[dict[str, Any], bytes]:
+    def _decode_cloud(self, key: str, msg: Any, ts: float | None = None) -> tuple[dict[str, Any], bytes]:
         t0 = time.time()
-        points, names = cloud_to_array(msg, self.cloud_fields)
-        points = crop_range(points, self.cloud_max_range)
+
+        def warn(text: str) -> None:
+            if not self._cloud_field_warned.get(text):
+                self._cloud_field_warned[text] = True
+                log(f"点云 {key}: {text}")
+
+        points, names, dtypes = cloud_to_array(msg, self.cloud_fields, warn=warn)
+        try:  # 同 n_pts：只用于日志/统计，转不动就当 0
+            n_raw = int(points.shape[0])
+        except (TypeError, ValueError):
+            n_raw = 0
+
+        # ── 时间戳：把「到达时刻」换成「帧首时刻」─────────────────────────────
+        # 为什么：下游（Point-LIO）把 header.stamp 当**帧首**用（lidar_end_time =
+        # 帧首 + 帧内跨度），我们若打到达时刻，LIO 的内建时钟就比物理时间晚整整
+        # 一帧（还多等一帧的 IMU），姿态戳会跑到“未来”。
+        # 点云自带逐点绝对时间（timestamp 列，实测单调、跨度 99.8 ms），所以
+        #   帧首 = 到达时刻 − (最后一个有效点时刻 − 机器人 header.stamp)
+        # 没有 timestamp 列就退回到达时刻（旧行为）。
+        ts_out = ts if ts is not None else time.time()
+        hdr_start = self._cloud_hdr.get(key, 0.0)
+        frame_span = 0.0
+        if "timestamp" in names and points.shape[0] > 1:
+            try:  # 时间列异常（NaN/inf）就退回到达时刻，不能因为打戳把整帧丢掉
+                tcol = points["timestamp"].astype(np.float64)
+                t_last = float(np.max(tcol))
+                span = (t_last - hdr_start) if hdr_start > 0 else (t_last - float(np.min(tcol)))
+                if np.isfinite(span) and 0.0 < span < 1.0:  # 只信合理量级（帧长 ≤ 1 s）
+                    ts_out -= span
+                    frame_span = span
+            except (TypeError, ValueError):
+                frame_span = 0.0
+
+        if self.cloud_filter_zero:
+            points = drop_zero_points(points)
+        points = crop_range(points, self.cloud_max_range, self.cloud_min_range)
         points = voxel_downsample(points, self.cloud_voxel)
         if self.cloud_max_points > 0 and points.shape[0] > self.cloud_max_points:
             idx = np.random.choice(points.shape[0], size=self.cloud_max_points, replace=False)
             idx.sort()
             points = points[idx]
-        payload = np.ascontiguousarray(points, dtype="<f4").tobytes()
+        # 结构化数组本身就是紧凑小端布局，直接 tobytes = point_step×点数的点表
+        payload = np.ascontiguousarray(points).tobytes()
+        point_step = points.dtype.itemsize
         try:  # numpy shape 恒为整数；防御性转换（JSON 序列化需要 Python int）
             n_pts = int(points.shape[0])
         except (TypeError, ValueError):
@@ -675,16 +825,26 @@ class Collector:
         header = {
             "t": "cloud",
             "k": key,
-            "ts": time.time(),
+            # 见上面：有逐点时间就取**帧首**，否则退回到达时刻
+            "ts": ts_out,
             "fields": names,
+            "field_dtypes": dtypes,   # 与 fields 一一对应的 numpy 类型（node.py 照它发 PointField）
+            "point_step": point_step,
             "points": n_pts,
+            "points_raw": n_raw,
+            "frame_span_ms": round(frame_span * 1000.0, 3),
             "decode_ms": round((time.time() - t0) * 1000.0, 2),
+            "stamp_lag_ms": round((time.time() - ts_out) * 1000.0, 2),
             "hdr_stamp": [
                 safe_int(getattr(msg.header.stamp, "sec", 0)),
                 safe_int(getattr(msg.header.stamp, "nanosec", 0)),
             ],
             "hdr_frame_id": str(getattr(msg.header, "frame_id", "")),
         }
+        if hdr_start > 0:  # 时序诊断：点云侧链路/解码滞后（机器人时钟的绝对偏差会与 IMU 相减抵消）
+            lag = ts_out - hdr_start
+            with self._lock:
+                self._lag_cloud = lag if self._lag_cloud is None else 0.9 * self._lag_cloud + 0.1 * lag
         return header, payload
 
     def _source_watchdog(self) -> None:
@@ -786,10 +946,30 @@ class Collector:
             jd = "无数据" if jf < 0 else f"{jf}s"
             bat = f"{lb['voltage']}V/{lb['soc']}%" if lb else "无数据"
             sp = sport_frame["name"] if isinstance((sport_frame := frame.get("sport")), dict) else "无数据"
+            with self._lock:
+                lc, li = self._lag_cloud, self._lag_imu
+            # 时序诊断：点云与 IMU 的**相对**滞后（机器人时钟的绝对偏差相减抵消）。
+            # 它就是 Point-LIO 的 common.time_lag_imu_to_lidar 要补的量（负值 = 把 IMU 往后挪）。
+            if lc is not None and li is not None:
+                timing = f" 点云−IMU滞后差={1000.0 * (lc - li):+.0f}ms（LIO: time_lag={-(lc - li):+.3f}）"
+            else:
+                timing = ""
+            # 点云输出帧率（解码后真发给 ROS 的）vs 上面的 DDS 到达率：差值 = 桥内丢帧
+            cloud_out = ""
+            if self.cloud_enabled:
+                with self._lock:
+                    cur = dict(self._cloud_out)
+                parts = [
+                    f"{k}={round((cnt - self._cloud_out_prev.get(k, 0)) / period, 2)}"
+                    for k, cnt in cur.items()
+                ]
+                self._cloud_out_prev = dict(cur)
+                if parts:
+                    cloud_out = " 云输出Hz[" + " ".join(parts) + "]"
             log(
                 f"状态: 运控={sp} mode_machine={frame.get('mode_machine')} 关节={jd} 电池={bat} | "
                 f"点云源={self._active_cloud if self.cloud_enabled else 'off'} "
-                f"IMU源={self._active_imu if self.imu_enabled else 'off'} | {rates}"
+                f"IMU源={self._active_imu if self.imu_enabled else 'off'}{timing}{cloud_out} | {rates}"
             )
 
     def _connect(self) -> None:

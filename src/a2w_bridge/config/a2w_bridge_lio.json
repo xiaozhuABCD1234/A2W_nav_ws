@@ -1,0 +1,16 @@
+{
+  "extends": "a2w_bridge.json",
+  "pointcloud": {
+    "fields": [
+      "x",
+      "y",
+      "z",
+      "intensity",
+      "ring",
+      "timestamp"
+    ]
+  },
+  "imu": {
+    "source": "lidar_front"
+  }
+}

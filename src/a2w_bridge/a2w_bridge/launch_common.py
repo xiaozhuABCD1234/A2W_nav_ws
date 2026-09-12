@@ -54,13 +54,21 @@ def _num(value: Any, default: float) -> float:
 
 
 def config_defaults(config_path: str | Path | None = None) -> dict[str, Any]:
-    """JSON 配置里的 ros/display 默认值（读不到就回安全默认：隔离开、域 42）。"""
-    from .config import default_config_path
+    """JSON 配置里的 ros/display 默认值（读不到就回安全默认：隔离开、域 42）。
+
+    走 ``config.load_config``（带默认值/规范化，且认识 ``extends``）而不是直接 json.load：
+    像 ``a2w_bridge_lio.json`` 这种只写了差异项的继承配置里并没有 ``ros`` 节，
+    直读就丢了 ``fastdds_profile`` → 隔离只剩域、FastDDS 仍会去绑机器人网卡。
+    """
+    from .config import default_config_path, load_config
 
     path = Path(config_path) if config_path else Path(default_config_path())
-    raw = load_json(path)
-    ros = raw.get("ros") or {}
-    disp = raw.get("display") or {}
+    try:
+        cfg: dict[str, Any] = load_config(path, strict=False)
+    except Exception:  # noqa: BLE001 —— launch 阶段不因为配置读不到就崩，退回安全默认
+        cfg = {}
+    ros = cfg.get("ros") or {}
+    disp = cfg.get("display") or {}
     isolate = bool(ros.get("isolate", True))
     try:
         domain = int(ros.get("domain_id", 42))

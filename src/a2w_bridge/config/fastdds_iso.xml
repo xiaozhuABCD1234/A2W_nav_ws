@@ -8,7 +8,9 @@
     这张网卡上——机器人侧用 CycloneDDS 0.10.2，跨实现类型对象会让它出问题，
     运控会落到“阻尼＝软急停”（官方：1001 / Damp()“最高优先级，用于突发情况下的急停”）。
     实测：不加隔离时 `ros2 topic echo` 会在机器人网卡上加入 239.255.0.1；
-          加本配置后该网卡上不再有任何 DDS 组播（只 lo）。
+          加本配置后 **ROS2 侧只在 lo 上加入该组播**（`ip maddr show lo | grep 239.255.0.1`）。
+          ⚠️ 机器人网卡上仍会看到 239.255.0.1：那是采集器的 CycloneDDS（域 0，收机器人 DDS），
+          属于设计内；判定隔离只看 ROS2 有没有把发现包发到那张网卡。
 
   用法：
     export FASTDDS_DEFAULT_PROFILES_FILE=/path/to/fastdds_iso.xml

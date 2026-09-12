@@ -92,6 +92,11 @@ DEFAULTS: dict[str, Any] = {
         # 已变换到前雷达），所以三路共用这一个 frame；外参见 tf.transforms。
         # 输出字段（标准 PointCloud2 字段名）；可用: x y z intensity ring timestamp
         "fields": ["x", "y", "z", "intensity"],
+        # 丢掉机器人填的 (0,0,0) 无效点：机器人在 128×900 固定网格里把“没回波”的格子填 0，
+        # 实机实测占 68%（115200 点里 78750 个），且 is_dense=true。开着它能替下游
+        # （Point-LIO、costmap、RViz）去掉“传感原点处的假障碍物”，并省 2/3 带宽。
+        "filter_zero": True,
+        "min_range": 0.0,  # >0 = 丢掉比该距离更近的点（米，0 = 不裁）——用来去自车体回波
         "max_points": 0,   # >0 = 每帧随机抽稀到该点数（0 = 全量）
         "max_range": 0.0,  # >0 = 按到原点距离裁剪（米，0 = 不裁剪）
         "voxel": 0.0,      # >0 = 体素下采样边长（米，0 = 不下采样）
@@ -234,9 +239,20 @@ def _num_list(key: str, values: Any) -> list[float]:
         raise ConfigError(f"配置 {key} 必须是数值数组: {values!r}") from exc
 
 
-def load_config(path: str | os.PathLike[str], *, strict: bool = True) -> dict[str, Any]:
-    """读取 JSON 配置并与默认值合并；``strict=True`` 时做取值校验。"""
-    path = Path(path).expanduser()
+def _read_raw(path: Path, seen: tuple[Path, ...]) -> dict[str, Any]:
+    """读一份 JSON 配置，并处理 ``extends``（先取被继承的那份，再把本文件的键合上去）。
+
+    ``extends`` 的值是相对**本文件所在目录**的路径（也可以是绝对路径）。只支持一层层合，
+    不支持数组合并（数组整个替掉）—— 见 ``_deep_merge``。
+
+    为什么要有它：A2W 的标定/网卡/话题全在那份大 JSON 里，而“喂 Point-LIO 的那份”只差
+    ``fields/min_range/imu.source`` 三个键。靠 ``extends`` 继承，标定改了只改一处，不会
+    两份配置各自漂移。
+    """
+    path = path.expanduser().resolve()
+    if path in seen:
+        chain = " → ".join(str(p) for p in (*seen, path))
+        raise ConfigError(f"配置文件 extends 成环: {chain}")
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
@@ -246,6 +262,20 @@ def load_config(path: str | os.PathLike[str], *, strict: bool = True) -> dict[st
         raise ConfigError(f"配置文件 JSON 语法错误: {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError(f"配置根节点必须是 JSON 对象: {path}")
+
+    parent = raw.pop("extends", None)
+    if parent in (None, ""):
+        return raw
+    base_path = Path(str(parent)).expanduser()
+    if not base_path.is_absolute():
+        base_path = path.parent / base_path
+    return _deep_merge(_read_raw(base_path, (*seen, path)), raw)
+
+
+def load_config(path: str | os.PathLike[str], *, strict: bool = True) -> dict[str, Any]:
+    """读取 JSON 配置（支持 ``extends`` 继承）并与默认值合并；``strict=True`` 时做取值校验。"""
+    path = Path(path).expanduser()
+    raw = _read_raw(path, ())
 
     cfg = _deep_merge(DEFAULTS, raw)
     cfg["_config_path"] = str(path)
@@ -262,6 +292,8 @@ def _normalize(cfg: dict[str, Any]) -> None:
     pc["failover_order"] = _as_list(pc.get("failover_order")) or list(CLOUD_FAILOVER_ORDER)
     pc["mode"] = str(pc.get("mode", "single")).lower()
     pc["source"] = str(pc.get("source", "auto")).lower()
+    pc["filter_zero"] = bool(pc.get("filter_zero", True))
+    pc["min_range"] = _num(float, "pointcloud.min_range", pc.get("min_range", 0.0) or 0.0)
     pc["max_points"] = _num(int, "pointcloud.max_points", pc.get("max_points", 0) or 0)
     pc["max_range"] = _num(float, "pointcloud.max_range", pc.get("max_range", 0.0) or 0.0)
     pc["voxel"] = _num(float, "pointcloud.voxel", pc.get("voxel", 0.0) or 0.0)
@@ -333,6 +365,8 @@ def validate(cfg: dict[str, Any]) -> None:
     pc = cfg["pointcloud"]
     if pc["mode"] not in ("single", "multi"):
         raise ConfigError(f"pointcloud.mode 只能是 single/multi，当前 {pc['mode']!r}")
+    if pc["min_range"] < 0:
+        raise ConfigError(f"pointcloud.min_range 不能为负，当前 {pc['min_range']!r}")
     if pc["mode"] == "single":
         allowed = list(CLOUD_TOPICS) + ["auto"]
         if pc["source"] not in allowed:
@@ -483,6 +517,15 @@ def describe(cfg: dict[str, Any]) -> str:
     cloud = "关闭" if not pc.get("enabled") else (
         f"multi({','.join(pc.get('multi_topics', {}))})" if pc["mode"] == "multi" else pc["source"]
     )
+    if pc.get("enabled"):  # 把实际生效的滤波一并印出来（这些参数直接决定点数/带宽）
+        flags = ["丢零点" if pc.get("filter_zero", True) else "含零点"]
+        if pc.get("min_range", 0.0) > 0:
+            flags.append(f">={pc['min_range']:g}m")
+        if pc.get("max_range", 0.0) > 0:
+            flags.append(f"<={pc['max_range']:g}m")
+        if pc.get("voxel", 0.0) > 0:
+            flags.append(f"voxel={pc['voxel']:g}")
+        cloud = f"{cloud},{','.join(flags)}"
     joints = cfg["joints"]
     joint_desc = f"关节({len(joints['names'])}" if joints.get("enabled") else "关节(关"
     joint_desc = f"{joint_desc}个)"
