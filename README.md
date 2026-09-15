@@ -1,5 +1,12 @@
 # 自研机器狗 ROS 2 导航工作空间
 
+> **上位机 / 下位机分工**：本仓库是**上位机**侧（导航）——只消费机器人数据、跑 LIO / 建图 /
+> Nav2 / 规划，并向机器人请求速度。机器狗本体上的**下位机控制程序**
+> （遥控 CRSF 接管、IMU、四轮 SocketCAN 轮毂电机、12 路腿部电机的统一实机控制、RL 行走策略、
+> 站立/趴窝/急停安全状态机）在 **[MYGO-contorl](https://github.com/xiaozhuABCD1234/MYGO-contorl)**。
+> 关节级闭环、站立姿态、策略切换与硬急停都由下位机执行，本仓库不参与，只通过 `a2w_bridge`
+> 的运动通道（`/cmd_vel` → `sport Move`）请求速度。
+
 ## 一、运行步骤
 
 ```bash
@@ -20,7 +27,7 @@ ros2 launch a2w_bridge a2w_bridge.launch.py
 
 # 4) 验证
 ros2 topic hz /a2w/points /a2w/imu
-ros2 topic hz /a2w/joint_states           # 16 关节（需机器人底层服务运行中）
+ros2 topic hz /a2w/joint_states           # 16 关节（需下位机控制程序 MYGO-contorl 运行中）
 ros2 topic echo /a2w/sport_state --once   # 运控状态机（error_code 1001 = 阻尼/软急停）
 ros2 topic echo /a2w/status --once        # 运控状态、模式、关节新鲜度
 ip maddr show lo | grep 239.255.0.1       # ROS 2 仅在回环组播（机器人网卡上的条目属采集器，正常）
@@ -85,6 +92,10 @@ ros2 launch a2w_gz_sim sim.launch.py gui:=false
 进程拆分的直接原因是 Python SDK 依赖的 `cyclonedds==0.10.2`（PyPI 仅提供 cp37~cp310 wheel）
 与本机 `rclpy` 运行所在的 Python 3.14 无法共存于同一解释器；该结构同时使“机器人网卡上的 DDS”
 与“ROS 2 域内的 DDS”在物理上分离。
+
+图中上半部分即机器人本体（192.168.123.0/24）上的**下位机**：关节闭环、站立与安全状态机、
+RL 行走策略与遥控接管均由 **[MYGO-contorl](https://github.com/xiaozhuABCD1234/MYGO-contorl)**
+执行；本仓库只读它的关节/运控状态，只经 `sport Move` 请求速度，不接管任何关节。
 
 **发布的话题**：数据原样透传，统一使用采集端墙钟时间戳（机器人自带时间戳仅记录日志）。
 
@@ -161,7 +172,7 @@ map ──(AMCL)──▶ camera_init ──(point_lio / legkilo)──▶ body
              ▼
   Nav2 地图栈：a2w_scan ─▶ /scan ─▶ AMCL + 全局/局部代价地图 ─▶ Nav2(DWB) ─┐
              └─▶ /a2w/points_nav ─▶ 局部 voxel 层                        │
-  无图栈：/cloud_registered + /Odomtry + /a2w/body_odom ─▶ SCAN-Planner ──┼─▶ /cmd_vel ─▶ 桥运动通道 ─▶ sport Move
+  无图栈：/cloud_registered + /Odomtry + /a2w/body_odom ─▶ SCAN-Planner ──┼─▶ /cmd_vel ─▶ 桥运动通道 ─▶ sport Move（下位机）
   全局重定位：/a2w/points_nav ─▶ BBS + NDT_OMP ─▶ a2w_relocalize ─▶ /initialpose ─▶ AMCL（修正定位）
 ```
 
@@ -218,3 +229,16 @@ map ──(AMCL)──▶ camera_init ──(point_lio / legkilo)──▶ body
 各包的算法推导、逐参数依据与排错手册见包内 README：
 [`a2w_bridge`](src/a2w_bridge/README.md) · [`a2w_nav2`](src/a2w_nav2/README.md) ·
 [`a2w_teleop`](src/a2w_teleop/README.md)（`a2w_gz_sim`、`legkilo`、`scan_planner` 暂无包内 README）。
+
+---
+
+## 五、关联仓库
+
+| 仓库 | 角色 | 内容 |
+| --- | --- | --- |
+| **本仓库** `A2W_nav_ws` | **上位机（导航）** | 数据桥接、LIO、建图、Nav2 / SCAN-Planner、全局重定位、Gazebo 仿真；只下发速度指令 |
+| [`MYGO-contorl`](https://github.com/xiaozhuABCD1234/MYGO-contorl) | **下位机（机器狗本体控制）** | 遥控 CRSF、IWT603 IMU、四轮 M3508/C620（SocketCAN）、12 路 Unitree 腿电机、RL 行走策略、站立/趴窝/急停安全状态机 |
+
+下位机程序的编译、配置与分阶段运行（先 `--diagnose` 零驱动力诊断、再整机控制）见其仓库
+README；**本仓库不含任何关节级控制代码**，上机前两侧需分别确认状态（下位机 `state=STAND_HOLD`、
+上位机 `motion.enabled` 与 `dry_run` 配置）。
